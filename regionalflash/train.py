@@ -166,7 +166,7 @@ def main() -> None:
     p.add_argument("--depth", type=int, default=12)
     p.add_argument("--num-heads", type=int, default=12)
     p.add_argument("--patch-xy", type=int, default=8)
-    p.add_argument("--kv-ctx-noise", type=float, default=0.05)
+    p.add_argument("--kv-ctx-noise", type=float, default=0.0)
 
     # Training recipe
     p.add_argument("--epochs", type=int, default=30)
