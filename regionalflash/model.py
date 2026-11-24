@@ -536,7 +536,7 @@ class RegionalFlashJiT3D(nn.Module):
         embed_dim: int = 768,
         depth: int = 12,
         num_heads: int = 12,
-        global_cond_dim: int = 7,  # [sin_h, cos_h, sin_doy, cos_doy, lat_norm, lon_norm, t_flow]
+        global_cond_dim: int = 15,  # [time(4), lat/lon(2), solar_ctx+tgt+noon(8), t_flow(1)]
         time_emb_dim: int = 64,
         adaln_rank: int = 128,
         prefix_attn: bool = False,

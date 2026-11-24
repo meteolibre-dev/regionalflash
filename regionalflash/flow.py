@@ -16,6 +16,7 @@ import math
 import torch
 
 from . import config
+from .solar import solar_step_features
 
 C_CERRA = config.N_DYN_CHANNELS  # 57
 C_SAT = 11                       # 11 European SatWeave bands
@@ -279,6 +280,9 @@ def sample_tiled_europe(
     time_feats: torch.Tensor,
     lat_full: torch.Tensor,
     lon_full: torch.Tensor,
+    ctx_unix_s: float,
+    tgt_unix_s: float,
+    noon_unix_s: float,
     patch_size: int = config.PATCH_SIZE,
     stride: int = config.TILE_STRIDE,
     n_steps: int = 20,
@@ -345,9 +349,14 @@ def sample_tiled_europe(
                 st_list.append(st)
 
                 cy, cx = y0 + patch_size // 2, x0 + patch_size // 2
-                lat_n = (lat_full[cy, cx] - 48.0) / 15.0
-                lon_n = (lon_full[cy, cx] - 10.0) / 25.0
-                gc_list.append(torch.cat([time_feats, lat_n.view(1), lon_n.view(1), t_cur.view(1)], dim=0))
+                c_lat = float(lat_full[cy, cx].item())
+                c_lon = float(lon_full[cy, cx].item())
+                lat_n = torch.tensor([(c_lat - 48.0) / 15.0], device=device, dtype=time_feats.dtype)
+                lon_n = torch.tensor([(c_lon - 10.0) / 25.0], device=device, dtype=time_feats.dtype)
+                sol_t = torch.from_numpy(
+                    solar_step_features(ctx_unix_s, tgt_unix_s, noon_unix_s, c_lon, c_lat)
+                ).to(device=device, dtype=time_feats.dtype)
+                gc_list.append(torch.cat([time_feats, lat_n, lon_n, sol_t, t_cur.view(1)], dim=0))
 
             x_in = torch.stack([torch.stack(f0_list, dim=0), torch.stack(f1_list, dim=0)], dim=2)
             x0_g, x0_m = model(

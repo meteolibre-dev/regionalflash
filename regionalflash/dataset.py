@@ -19,6 +19,7 @@ import pandas as pd
 import zarr
 
 from . import config
+from .solar import solar_step_features
 
 METAR_COLS = ["tmpc", "dwpc", "mslp_anom_hpa", "u10", "v10", "p01m"]
 # Simple physical normalization constants for METAR (tmpc, dwpc, mslp_anom, u10, v10, log1p(p01m))
@@ -160,6 +161,15 @@ class RegionalFlashMultimodalDataset:
             axis=-1,
         ).astype(np.float32)
 
+        # Precompute Unix seconds for sensor context (t0+2h), sensor target (t0+5h), and UTC noon
+        epoch = pd.Timestamp("1970-01-01", tz="UTC")
+        ts_ctx_sensor = ts_df["timestamp_utc"] + pd.Timedelta(hours=2)
+        ts_tgt_sensor = ts_df["timestamp_utc"] + pd.Timedelta(hours=5)
+        ts_noon = ts_ctx_sensor.dt.normalize() + pd.Timedelta(hours=12)
+        self.ctx_unix_s = (ts_ctx_sensor - epoch).dt.total_seconds().to_numpy(dtype=np.float64)
+        self.tgt_unix_s = (ts_tgt_sensor - epoch).dt.total_seconds().to_numpy(dtype=np.float64)
+        self.noon_unix_s = (ts_noon - epoch).dt.total_seconds().to_numpy(dtype=np.float64)
+
         # 6. Sparse METAR CSR index
         metar_path = root / "metar_obs_plus2h.parquet"
         self.metar_idx = _MetarIndex(metar_path, self.n_times) if metar_path.exists() else None
@@ -258,9 +268,20 @@ class RegionalFlashMultimodalDataset:
         static_patch = self.static[:, y0 : y0 + P, x0 : x0 + P]
 
         cy, cx = y0 + P // 2, x0 + P // 2
-        lat_norm = np.float32((self.lat[cy, cx] - 48.0) / 15.0)
-        lon_norm = np.float32((self.lon[cy, cx] - 10.0) / 25.0)
-        global_cond = np.concatenate([self.time_feats[t0], np.array([lat_norm, lon_norm], dtype=np.float32)])
+        c_lat = float(self.lat[cy, cx])
+        c_lon = float(self.lon[cy, cx])
+        lat_norm = np.float32((c_lat - 48.0) / 15.0)
+        lon_norm = np.float32((c_lon - 10.0) / 25.0)
+        solar_8d = solar_step_features(
+            self.ctx_unix_s[t0],
+            self.tgt_unix_s[t0],
+            self.noon_unix_s[t0],
+            c_lon,
+            c_lat,
+        )
+        global_cond = np.concatenate(
+            [self.time_feats[t0], np.array([lat_norm, lon_norm], dtype=np.float32), solar_8d]
+        )  # (14,) float32
 
         return {
             "grid_ctx": grid_ctx,
