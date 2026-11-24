@@ -68,7 +68,7 @@ def trainer_step(
     cerra_ch_weights: torch.Tensor | None = None,
     use_residual: bool = True,
     metar_drop_frac: float = 0.15,
-    metar_loss_weight: float = 0.10,
+    metar_loss_weight: float = 1.0,
     sat_loss_weight: float = 0.35,
     radar_loss_weight: float = 0.25,
     metar_count_denom: float = 15.0,

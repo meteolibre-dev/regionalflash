@@ -542,6 +542,7 @@ class RegionalFlashJiT3D(nn.Module):
         prefix_attn: bool = False,
         kv_ctx_noise: float = 0.0,
         metar_head_dim: int = 64,
+        isolate_metar_grad: bool = True,
     ):
         super().__init__()
         self.c_grid_out = c_grid_out
@@ -551,6 +552,7 @@ class RegionalFlashJiT3D(nn.Module):
         self.embed_dim = embed_dim
         self.time_emb_dim = time_emb_dim
         self.kv_ctx_noise = float(kv_ctx_noise)
+        self.isolate_metar_grad = bool(isolate_metar_grad)
 
         H, W = img_size
         self.grid_t = 2
@@ -676,5 +678,6 @@ class RegionalFlashJiT3D(nn.Module):
         target_tokens = tokens[:, n_tpf:, :]
 
         pred_grid = self.head_grid(target_tokens, H=H, W=W)  # (B, 69, H, W)
-        pred_metar = self.head_metar(target_tokens, ctx_metar, noisy_metar, ctx_metar_mask, static)  # (B, 6, H, W)
+        metar_tokens = target_tokens.detach() if self.isolate_metar_grad else target_tokens
+        pred_metar = self.head_metar(metar_tokens, ctx_metar, noisy_metar, ctx_metar_mask, static)  # (B, 6, H, W)
         return pred_grid, pred_metar
