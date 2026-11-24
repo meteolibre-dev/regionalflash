@@ -70,7 +70,7 @@ def apply_blur_batched_2d(x: torch.Tensor, blur_sigma: torch.Tensor, n_bins: int
         k1d = torch.exp(-(coords ** 2) / (2.0 * s * s))
         k1d = k1d / k1d.sum()
         k2d = (k1d[:, None] * k1d[None, :]).expand(C, 1, k, k)
-        out[mask] = F.conv2d(xb, k2d, padding=k // 2, groups=C)
+        out[mask] = F.conv2d(xb, k2d, padding=k // 2, groups=C).to(out.dtype)
     return out
 
 
