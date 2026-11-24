@@ -107,7 +107,6 @@ def evaluate(
                 device,
                 cerra_ch_weights=cerra_ch_weights,
                 use_residual=use_residual,
-                blur_sigma=0.0,
                 metar_drop_frac=0.0,
             )
         for k, v in metrics.items():
@@ -179,7 +178,6 @@ def main() -> None:
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--ema-decay", type=float, default=0.999)
-    p.add_argument("--blur-sigma", type=float, default=0.5)
     p.add_argument("--metar-drop-frac", type=float, default=0.15)
     p.add_argument("--noise-rho", type=float, default=0.0)
     p.add_argument("--num-workers", type=int, default=8)
@@ -281,7 +279,6 @@ def main() -> None:
                     device,
                     cerra_ch_weights=cerra_ch_weights,
                     use_residual=True,
-                    blur_sigma=args.blur_sigma,
                     metar_drop_frac=args.metar_drop_frac,
                     noise_rho=args.noise_rho,
                 )

@@ -9,13 +9,11 @@ multimodal regional setup (`CERRA(t) + Sat(t+2h) + Radar(t+2h) + METAR(t+2h)` ->
     channels; absolute target on intermittent Sat / Radar / METAR `(u10, v10, p01m)`
   - Masked per-channel MSE with FastNet-style inverse tendency variance weights (`delta_std_3h`)
   - Station-count-weighted METAR loss + METAR context dropout (`metar_drop_frac`) for spatial fill
-  - Optional context Gaussian blur augmentation (`blur_sigma`) on dense channels for AR stability
   - Euler & Heun samplers + overlapping tiled-diffusion full-Europe inference (`sample_tiled_europe`).
 """
 import math
 
 import torch
-import torch.nn.functional as F
 
 from . import config
 
@@ -47,33 +45,6 @@ def structured_gaussian_noise(
     return math.sqrt(rho) * shared + math.sqrt(1.0 - rho) * indep
 
 
-def apply_blur_batched_2d(x: torch.Tensor, blur_sigma: torch.Tensor, n_bins: int = 8) -> torch.Tensor:
-    """Vectorized Gaussian blur on (B, C, H, W) via sigma binning."""
-    B, C, H, W = x.shape
-    out = torch.zeros_like(x)
-    sigma_max = float(blur_sigma.max().item())
-    bin_edges = torch.linspace(0.0, sigma_max + 1e-6, n_bins + 1, device=x.device)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-    bin_ids = torch.bucketize(blur_sigma, bin_edges[1:])
-
-    for b_idx in range(n_bins):
-        mask = bin_ids == b_idx
-        if not mask.any():
-            continue
-        s = float(bin_centers[b_idx].item())
-        xb = x[mask]
-        if s <= 0.2:
-            out[mask] = xb
-            continue
-        k = 2 * int(2.0 * s) + 1
-        coords = torch.arange(k, dtype=xb.dtype, device=x.device) - k // 2
-        k1d = torch.exp(-(coords ** 2) / (2.0 * s * s))
-        k1d = k1d / k1d.sum()
-        k2d = (k1d[:, None] * k1d[None, :]).expand(C, 1, k, k)
-        out[mask] = F.conv2d(xb, k2d, padding=k // 2, groups=C).to(out.dtype)
-    return out
-
-
 def _build_grid_residual_mask(device: torch.device) -> torch.Tensor:
     """True for CERRA (0..56), False for Sat (57..67) and Radar (68)."""
     m = torch.zeros(C_GRID, dtype=torch.bool, device=device)
@@ -95,7 +66,6 @@ def trainer_step(
     device: torch.device,
     cerra_ch_weights: torch.Tensor | None = None,
     use_residual: bool = True,
-    blur_sigma: float = 0.0,
     metar_drop_frac: float = 0.15,
     metar_loss_weight: float = 0.10,
     sat_loss_weight: float = 0.35,
@@ -146,14 +116,6 @@ def trainer_step(
         x0_grid = grid_tgt
         x0_metar = metar_tgt
 
-    # Optional on-manifold context blur on dense fields only (never blur sparse METAR!)
-    if blur_sigma > 0.0 and model.training:
-        eps_b = torch.randn(B, device=device)
-        s_vec = torch.sigmoid(1.4 + 1.8 * eps_b).clamp(1e-4, 1.0 - 1e-4) * blur_sigma
-        grid_ctx_in = apply_blur_batched_2d(grid_ctx, s_vec)
-    else:
-        grid_ctx_in = grid_ctx
-
     # METAR context station dropout (teaches spatial interpolation to unseen airports)
     metar_ctx_in = metar_ctx
     met_any_ctx = met_m_ctx.any(dim=1, keepdim=True)  # (B, 1, H, W)
@@ -178,7 +140,7 @@ def trainer_step(
     xt_metar = (1.0 - t_4d) * x0_metar + t_4d * eps_metar
 
     # Assemble 2-frame 5D input (B, C_in, 2, H, W)
-    frame0 = torch.cat([grid_ctx_in, metar_ctx_in, sat_m_ctx, rad_m_ctx, met_any_ctx.float(), static], dim=1)
+    frame0 = torch.cat([grid_ctx, metar_ctx_in, sat_m_ctx, rad_m_ctx, met_any_ctx.float(), static], dim=1)
     frame1 = torch.cat([xt_grid, xt_metar, sat_m_tgt, rad_m_tgt, met_any_ctx.float(), static], dim=1)
     x_in = torch.stack([frame0, frame1], dim=2)
     global_cond = torch.cat([g_cond, t.unsqueeze(1)], dim=1)  # t LAST for sinusoidal time emb

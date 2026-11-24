@@ -14,7 +14,7 @@
 * **JiT x-Prediction Rectified Flow (`regionalflash/flow.py`):**
   * Linear flow `x_t = (1 - t) x_0 + t eps`, stratified 32-bin `t`, clamped `1 / (t + 0.01)^2` x-loss weighting
   * Residual targets on CERRA + slow METAR vars (`tmpc, dwpc, mslp_anom_hpa`); absolute targets on Sat/Radar/wind/precip
-  * FastNet inverse 3h-tendency variance channel weights (`norm_stats.json`), masked sat/radar/station-count-weighted METAR losses, METAR context dropout (`0.15`), and context blur augmentation (`0.5`)
+  * FastNet inverse 3h-tendency variance channel weights (`norm_stats.json`), masked sat/radar/station-count-weighted METAR losses, and METAR context dropout (`0.15`)
   * Full-Europe overlapping **Tiled Diffusion** sampler (`sample_tiled_europe`) with raised-cosine blending at every denoising step.
 
 ---
