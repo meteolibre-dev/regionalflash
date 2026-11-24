@@ -118,7 +118,7 @@ class JiTAttention(nn.Module):
         num_heads: int,
         n_ctx_tokens: int,
         seq_len: int,
-        prefix_attn: bool = True,
+        prefix_attn: bool = False,
         kv_ctx_noise: float = 0.0,
     ):
         super().__init__()
@@ -184,7 +184,7 @@ class JiTBlock(nn.Module):
         n_ctx_tokens: int,
         seq_len: int,
         mlp_ratio: float = 2.6,
-        prefix_attn: bool = True,
+        prefix_attn: bool = False,
         kv_ctx_noise: float = 0.0,
         adaln_rank: int = 128,
         adaln_gate_init: float = 0.0,
@@ -539,7 +539,7 @@ class RegionalFlashJiT3D(nn.Module):
         global_cond_dim: int = 7,  # [sin_h, cos_h, sin_doy, cos_doy, lat_norm, lon_norm, t_flow]
         time_emb_dim: int = 64,
         adaln_rank: int = 128,
-        prefix_attn: bool = True,
+        prefix_attn: bool = False,
         kv_ctx_noise: float = 0.0,
         metar_head_dim: int = 64,
     ):

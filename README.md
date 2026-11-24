@@ -7,7 +7,7 @@
 ---
 
 ## 1. Architecture (`RegionalFlashJiT3D`)
-* **Core DiT Trunk (`regionalflash/model.py`):** `103.5M` params (`dim=768, depth=12, heads=12, patch=(1, 8, 8)`), `RMSNorm`, `SwiGLU`, `QK-Norm`, `3D Axial RoPE`, canonical **Low-rank AdaLN-Zero**, and **Prefix Causal Attention** (`T = 2`: frame 0 known conditional context, frame 1 noisy target to denoise).
+* **Core DiT Trunk (`regionalflash/model.py`):** `99.65M` params (`dim=768, depth=12, heads=12, patch=(1, 8, 8)`), physics-structured `AtmosphericPatchEmbed`, `RMSNorm`, `SwiGLU`, `QK-Norm`, `3D Axial RoPE`, canonical **Low-rank AdaLN-Zero**, and **full bidirectional (non-causal) FlashAttention** across `T = 2` frames (frame 0 known context, frame 1 noisy target).
 * **Dual Output Heads:**
   * `head_grid` (`69` ch): dense `CERRA(57)` + `SatWeave(11)` + `OPERA Radar dbzh(1)`
   * `head_metar` (`6` ch): dedicated 2D conv-refined airport head (`tmpc, dwpc, mslp_anom_hpa, u10, v10, p01m`)
