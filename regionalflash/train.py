@@ -181,6 +181,7 @@ def main() -> None:
     p.add_argument("--metar-drop-frac", type=float, default=0.15)
     p.add_argument("--noise-rho", type=float, default=0.0)
     p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--prefetch-factor", type=int, default=1)
     p.add_argument("--compile", action="store_true", help="Use torch.compile on model")
     p.add_argument("--resume", type=Path, default=None)
     args = p.parse_args()
@@ -208,13 +209,16 @@ def main() -> None:
         pin_memory=True,
         drop_last=True,
         persistent_workers=(args.num_workers > 0),
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
     )
+    val_workers = min(4, max(2, args.num_workers // 2)) if args.num_workers > 0 else 0
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=max(2, args.num_workers // 2),
+        num_workers=val_workers,
         pin_memory=True,
+        prefetch_factor=(1 if val_workers > 0 else None),
     )
 
     model = RegionalFlashJiT3D(
