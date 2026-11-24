@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.idx
+*.nc
+*.grib
+*.grib2
+data/
+runs/
+outputs/
+.DS_Store
