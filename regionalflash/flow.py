@@ -404,7 +404,7 @@ def sample_tiled_europe(
         )
 
         # Hybrid METAR forcing: zero non-station x0_metar on every step EXCEPT the last
-        if i < n_steps - 1:
+        if step_i < n_steps - 1:
             x0_metar_step = torch.where(met_any_full > 0.5, x0_metar_full, torch.zeros_like(x0_metar_full))
         else:
             x0_metar_step = x0_metar_full
