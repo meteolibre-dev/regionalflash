@@ -465,6 +465,42 @@ class StructuredGridDecoder(nn.Module):
         return torch.cat([air_grid, grid_2d], dim=1)  # (B, 69, H, W)
 
 
+class LandCoverEmbed(nn.Module):
+    """Input-only soft land-cover & coast-distance embedding (zero-initialized outputs).
+
+    Takes `(B, c_landcover, H, W)` — e.g. 6 ESA WorldCover fractional class channels
+    (tree, grass, crop, urban, bare, water; sum=1 -> soft `nn.Embedding`) + `log_dist_coast`.
+    Produces two zero-initialized residual embeddings:
+      1. `tok_emb`: `(B, Hp * Wp, embed_dim)` added to both frame0 & frame1 ViT tokens.
+      2. `pix_emb`: `(B, metar_head_dim, H, W)` added at full 5.5 km resolution inside `MetarRefinementHead`.
+    Because both output projections start at zero, this module plugs straight onto a
+    pretrained v1 checkpoint with bit-for-bit identical predictions at step 0.
+    """
+
+    def __init__(
+        self,
+        c_landcover: int,
+        patch_size: tuple[int, int, int],
+        embed_dim: int,
+        metar_head_dim: int,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        _, ph, pw = patch_size
+        self.soft_emb = nn.Sequential(
+            nn.Conv2d(c_landcover, hidden_dim, kernel_size=1),
+            nn.GELU(),
+        )
+        self.to_tokens = nn.Conv2d(hidden_dim, embed_dim, kernel_size=(ph, pw), stride=(ph, pw))
+        self.to_metar = nn.Conv2d(hidden_dim, metar_head_dim, kernel_size=1)
+
+    def forward(self, landcover: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.soft_emb(landcover)  # (B, hidden, H, W)
+        tok = self.to_tokens(h).flatten(2).transpose(1, 2)  # (B, Hp*Wp, D)
+        pix = self.to_metar(h)  # (B, metar_head_dim, H, W)
+        return tok, pix
+
+
 class MetarRefinementHead(nn.Module):
     """Dedicated 2D conv refinement head for sparse METAR airport fields on the target frame.
 
@@ -501,9 +537,12 @@ class MetarRefinementHead(nn.Module):
         noisy_metar: torch.Tensor,
         ctx_metar_mask: torch.Tensor,
         static: torch.Tensor,
+        land_feat: torch.Tensor | None = None,
     ) -> torch.Tensor:
         H, W = static.shape[-2], static.shape[-1]
         feat = self.unpatch(target_tokens, T=1, H=H, W=W).squeeze(2)  # (B, hidden, H, W)
+        if land_feat is not None:
+            feat = feat + land_feat
         x = torch.cat([feat, ctx_metar, noisy_metar, ctx_metar_mask, static], dim=1)
         return self.conv(x)
 
@@ -543,10 +582,12 @@ class RegionalFlashJiT3D(nn.Module):
         kv_ctx_noise: float = 0.0,
         metar_head_dim: int = 64,
         isolate_metar_grad: bool = True,
+        c_landcover: int = 0,
     ):
         super().__init__()
         self.c_grid_out = c_grid_out
         self.c_metar_out = c_metar_out
+        self.c_landcover = int(c_landcover)
         self.c_in = c_grid_out + c_metar_out + c_cond_extra
         self.patch_size = patch_size
         self.embed_dim = embed_dim
@@ -562,6 +603,10 @@ class RegionalFlashJiT3D(nn.Module):
         seq_len = self.grid_t * self.tokens_per_frame
 
         self.patch_embed = AtmosphericPatchEmbed(patch_size, embed_dim)
+        self.landcover_embed = (
+            LandCoverEmbed(c_landcover, patch_size, embed_dim, metar_head_dim)
+            if c_landcover > 0 else None
+        )
         self.rope = RoPE3D(embed_dim // num_heads, max_t=4, max_h=self.grid_h * 2, max_w=self.grid_w * 2)
 
         # Global conditioning: [scalars (global_cond_dim - 1), sin/cos_time(time_emb_dim)]
@@ -625,6 +670,12 @@ class RegionalFlashJiT3D(nn.Module):
         nn.init.zeros_(self.head_grid.air_out.bias)
         nn.init.zeros_(self.head_grid.head_2d.linear.weight)
         nn.init.zeros_(self.head_grid.head_2d.linear.bias)
+        # Zero-init LandCoverEmbed output projections for seamless warm-start fine-tuning
+        if self.landcover_embed is not None:
+            nn.init.zeros_(self.landcover_embed.to_tokens.weight)
+            nn.init.zeros_(self.landcover_embed.to_tokens.bias)
+            nn.init.zeros_(self.landcover_embed.to_metar.weight)
+            nn.init.zeros_(self.landcover_embed.to_metar.bias)
 
     def _sinusoidal_time_emb(self, t: torch.Tensor) -> torch.Tensor:
         half = self.time_emb_dim // 2
@@ -640,15 +691,17 @@ class RegionalFlashJiT3D(nn.Module):
         noisy_metar: torch.Tensor,
         ctx_metar_mask: torch.Tensor,
         static: torch.Tensor,
+        landcover: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x_in:           (B, C_in, 2, H, W)
-            global_cond:    (B, 7) with diffusion flow time `t_flow` in the LAST column
+            global_cond:    (B, 15) with diffusion flow time `t_flow` in the LAST column
             ctx_metar:      (B, 6, H, W) clean normalized context METAR
             noisy_metar:    (B, 6, H, W) noisy target METAR at flow time t
             ctx_metar_mask: (B, 1, H, W) binary valid station mask in context
             static:         (B, 6, H, W) normalized static terrain + coords
+            landcover:      optional (B, c_landcover, H, W) input-only fractional land cover + coast dist
         Returns:
             pred_grid:  (B, 69, H, W)
             pred_metar: (B, 6, H, W)
@@ -661,6 +714,10 @@ class RegionalFlashJiT3D(nn.Module):
         c = self.context_mlp(torch.cat([global_cond[:, :-1], t_emb], dim=-1))
 
         tokens = self.patch_embed(x_in)  # (B, 2 * Hp * Wp, D)
+        land_pix = None
+        if self.landcover_embed is not None and landcover is not None:
+            land_tok, land_pix = self.landcover_embed(landcover)
+            tokens = tokens + torch.cat([land_tok, land_tok], dim=1)
         Hp, Wp = H // self.patch_size[1], W // self.patch_size[2]
 
         ctx_noise_scale = None
@@ -679,5 +736,5 @@ class RegionalFlashJiT3D(nn.Module):
 
         pred_grid = self.head_grid(target_tokens, H=H, W=W)  # (B, 69, H, W)
         metar_tokens = target_tokens.detach() if self.isolate_metar_grad else target_tokens
-        pred_metar = self.head_metar(metar_tokens, ctx_metar, noisy_metar, ctx_metar_mask, static)  # (B, 6, H, W)
+        pred_metar = self.head_metar(metar_tokens, ctx_metar, noisy_metar, ctx_metar_mask, static, land_feat=land_pix)
         return pred_grid, pred_metar

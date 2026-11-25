@@ -101,6 +101,7 @@ def trainer_step(
     met_m_ctx = batch["metar_mask_ctx"].to(device, non_blocking=True)
     met_m_tgt = batch["metar_mask_tgt"].to(device, non_blocking=True)
     static = batch["static"].to(device, non_blocking=True)
+    landcover = batch["landcover"].to(device, non_blocking=True) if "landcover" in batch else None
     g_cond = batch["global_cond"].to(device, non_blocking=True)
 
     B, _, H, W = grid_ctx.shape
@@ -153,6 +154,7 @@ def trainer_step(
         noisy_metar=xt_metar,
         ctx_metar_mask=met_any_ctx.float(),
         static=static,
+        landcover=landcover,
     )
 
     # JiT x-prediction loss weighting: upweight data-end (t -> 0)
@@ -221,6 +223,7 @@ def sample_next_step(
     use_residual: bool = True,
     noise_rho: float = 0.0,
     seed: int | None = None,
+    landcover: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Euler rectified-flow x-prediction ODE sampler from t=1 -> 0 for one 128x128 patch.
 
@@ -248,7 +251,7 @@ def sample_next_step(
         frame1 = torch.cat([xt_grid, xt_metar, sat_mask_tgt, radar_mask_tgt, met_any_ctx, static], dim=1)
         x_in = torch.stack([frame0, frame1], dim=2)
 
-        x0_g, x0_m = model(x_in, global_cond, metar_ctx, xt_metar, met_any_ctx, static)
+        x0_g, x0_m = model(x_in, global_cond, metar_ctx, xt_metar, met_any_ctx, static, landcover=landcover)
 
         # On-manifold forcing (FlashEdges): zero x0 at off-coverage SatWeave & OPERA Radar
         # pixels so x_t follows exact t*noise -> 0 decay there.
@@ -303,6 +306,7 @@ def sample_tiled_europe(
     tile_batch_size: int = 32,
     use_residual: bool = True,
     seed: int = 42,
+    landcover_full: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Multi-Diffusion / Tiled Diffusion over the full 1069x1069 European grid.
 
@@ -343,7 +347,7 @@ def sample_tiled_europe(
 
         for bi in range(0, len(tiles), tile_batch_size):
             batch_tiles = tiles[bi : bi + tile_batch_size]
-            f0_list, f1_list, cm_list, nm_list, cmm_list, st_list, gc_list = [], [], [], [], [], [], []
+            f0_list, f1_list, cm_list, nm_list, cmm_list, st_list, gc_list, lc_list = [], [], [], [], [], [], [], []
             for y0, x0 in batch_tiles:
                 y1, x1 = y0 + patch_size, x0 + patch_size
                 g0 = grid_ctx_full[:, y0:y1, x0:x1]
@@ -361,6 +365,8 @@ def sample_tiled_europe(
                 nm_list.append(mn)
                 cmm_list.append(ma)
                 st_list.append(st)
+                if landcover_full is not None:
+                    lc_list.append(landcover_full[:, y0:y1, x0:x1])
 
                 cy, cx = y0 + patch_size // 2, x0 + patch_size // 2
                 c_lat = float(lat_full[cy, cx].item())
@@ -380,6 +386,7 @@ def sample_tiled_europe(
                 torch.stack(nm_list, dim=0),
                 torch.stack(cmm_list, dim=0),
                 torch.stack(st_list, dim=0),
+                landcover=(torch.stack(lc_list, dim=0) if lc_list else None),
             )
 
             for ti, (y0, x0) in enumerate(batch_tiles):

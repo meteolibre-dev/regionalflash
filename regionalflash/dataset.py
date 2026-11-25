@@ -134,6 +134,13 @@ class RegionalFlashMultimodalDataset:
         self.lat = np.asarray(s_root["latitude"], dtype=np.float32)
         self.lon = np.asarray(s_root["longitude"], dtype=np.float32)
 
+        # 4b. Optional ESA WorldCover fractional land-cover + coast-distance (~32 MB, input-only)
+        lc_path = root / "landcover_5km.zarr"
+        self.landcover: np.ndarray | None = (
+            np.asarray(zarr.open_group(str(lc_path), mode="r")["landcover"], dtype=np.float32)
+            if lc_path.exists() else None
+        )
+
         stats = json.loads((root / "norm_stats.json").read_text())
         self.cerra_mean = np.asarray(stats["mean"], dtype=np.float32)[:, None, None]
         self.cerra_std = np.asarray(stats["std"], dtype=np.float32)[:, None, None]
@@ -283,7 +290,7 @@ class RegionalFlashMultimodalDataset:
             [self.time_feats[t0], np.array([lat_norm, lon_norm], dtype=np.float32), solar_8d]
         )  # (14,) float32
 
-        return {
+        sample = {
             "grid_ctx": grid_ctx,
             "grid_tgt": grid_tgt,
             "metar_ctx": m0,
@@ -299,3 +306,6 @@ class RegionalFlashMultimodalDataset:
             "time_idx": np.int64(t0),
             "yx": np.asarray([y0, x0], dtype=np.int64),
         }
+        if self.landcover is not None:
+            sample["landcover"] = self.landcover[:, y0 : y0 + P, x0 : x0 + P]
+        return sample

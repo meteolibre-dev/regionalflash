@@ -130,6 +130,7 @@ def evaluate(
                     n_steps=sample_steps,
                     use_residual=use_residual,
                     seed=100 + bi,
+                    landcover=(batch["landcover"].to(device) if "landcover" in batch else None),
                 )
             gt_t2m = batch["grid_tgt"][:, cerra_t2m_idx].to(device)
             pr_t2m = pg[:, cerra_t2m_idx]
@@ -184,6 +185,7 @@ def main() -> None:
     p.add_argument("--prefetch-factor", type=int, default=1)
     p.add_argument("--compile", action="store_true", help="Use torch.compile on model")
     p.add_argument("--resume", type=Path, default=None)
+    p.add_argument("--init-from", type=Path, default=None, help="Warm-start model+EMA weights (strict=False) with fresh optimizer")
     args = p.parse_args()
 
     if args.hf_download:
@@ -221,6 +223,7 @@ def main() -> None:
         prefetch_factor=(1 if val_workers > 0 else None),
     )
 
+    c_landcover = int(train_ds.landcover.shape[0]) if train_ds.landcover is not None else 0
     model = RegionalFlashJiT3D(
         img_size=(config.PATCH_SIZE, config.PATCH_SIZE),
         patch_size=(1, args.patch_xy, args.patch_xy),
@@ -228,11 +231,12 @@ def main() -> None:
         depth=args.depth,
         num_heads=args.num_heads,
         kv_ctx_noise=args.kv_ctx_noise,
+        c_landcover=c_landcover,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    log.info("RegionalFlashJiT3D: %.2fM params (dim=%d, depth=%d, heads=%d, patch=(1,%d,%d))",
-             n_params, args.embed_dim, args.depth, args.num_heads, args.patch_xy, args.patch_xy)
+    log.info("RegionalFlashJiT3D: %.2fM params (dim=%d, depth=%d, heads=%d, patch=(1,%d,%d), landcover=%d)",
+             n_params, args.embed_dim, args.depth, args.num_heads, args.patch_xy, args.patch_xy, c_landcover)
 
     ema_model = copy.deepcopy(model).eval()
     for p_ema in ema_model.parameters():
@@ -243,7 +247,12 @@ def main() -> None:
     start_epoch = 0
     global_step = 0
     best_val = float("inf")
-    if args.resume and args.resume.exists():
+    if args.init_from and args.init_from.exists():
+        ckpt = torch.load(args.init_from, map_location=device, weights_only=False)
+        miss_m, unexp_m = model.load_state_dict(ckpt["ema"], strict=False)
+        ema_model.load_state_dict(model.state_dict())
+        log.info("Warm-started model+EMA from %s (missing=%s, unexpected=%s)", args.init_from, miss_m, unexp_m)
+    elif args.resume and args.resume.exists():
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         ema_model.load_state_dict(ckpt["ema"])
