@@ -250,12 +250,26 @@ def sample_next_step(
 
         x0_g, x0_m = model(x_in, global_cond, metar_ctx, xt_metar, met_any_ctx, static)
 
+        # On-manifold forcing (FlashEdges): zero x0 at off-coverage SatWeave & OPERA Radar
+        # pixels so x_t follows exact t*noise -> 0 decay there.
+        x0_g = x0_g.clone()
+        x0_g[:, C_CERRA : C_CERRA + C_SAT] = torch.where(
+            sat_mask_tgt > 0.5, x0_g[:, C_CERRA : C_CERRA + C_SAT], torch.zeros_like(x0_g[:, C_CERRA : C_CERRA + C_SAT])
+        )
+        x0_g[:, C_CERRA + C_SAT :] = torch.where(
+            radar_mask_tgt > 0.5, x0_g[:, C_CERRA + C_SAT :], torch.zeros_like(x0_g[:, C_CERRA + C_SAT :])
+        )
+
         if i == n_steps - 1:
+            # Hybrid METAR forcing released on final step to keep dense spatial-fill forecast
             xt_grid, xt_metar = x0_g, x0_m
         else:
+            # Hybrid METAR forcing: zero non-station x0_m on intermediate steps so xt_metar
+            # stays on the exact t*noise -> 0 training marginal and never contaminates the trunk.
+            x0_m_step = torch.where(met_any_ctx > 0.5, x0_m, torch.zeros_like(x0_m))
             ratio = float(((t_cur - t_nxt) / t_cur.clamp(min=1e-5)).item())
             xt_grid = (1.0 - ratio) * xt_grid + ratio * x0_g
-            xt_metar = (1.0 - ratio) * xt_metar + ratio * x0_m
+            xt_metar = (1.0 - ratio) * xt_metar + ratio * x0_m_step
 
     if use_residual:
         g_rmask = _build_grid_residual_mask(device)
@@ -376,8 +390,27 @@ def sample_tiled_europe(
 
         x0_grid_full = torch.nan_to_num(acc_grid / acc_w, nan=0.0, posinf=8.0, neginf=-8.0)
         x0_metar_full = torch.nan_to_num(acc_metar / acc_w, nan=0.0, posinf=10.0, neginf=-6.0)
+
+        # On-manifold forcing (FlashEdges): zero off-coverage SatWeave & OPERA Radar x0 at every step
+        x0_grid_full[C_CERRA : C_CERRA + C_SAT] = torch.where(
+            sat_mask_full > 0.5,
+            x0_grid_full[C_CERRA : C_CERRA + C_SAT],
+            torch.zeros_like(x0_grid_full[C_CERRA : C_CERRA + C_SAT]),
+        )
+        x0_grid_full[C_CERRA + C_SAT :] = torch.where(
+            radar_mask_full > 0.5,
+            x0_grid_full[C_CERRA + C_SAT :],
+            torch.zeros_like(x0_grid_full[C_CERRA + C_SAT :]),
+        )
+
+        # Hybrid METAR forcing: zero non-station x0_metar on every step EXCEPT the last
+        if i < n_steps - 1:
+            x0_metar_step = torch.where(met_any_full > 0.5, x0_metar_full, torch.zeros_like(x0_metar_full))
+        else:
+            x0_metar_step = x0_metar_full
+
         xt_grid_full = (1.0 - ratio) * xt_grid_full + ratio * x0_grid_full
-        xt_metar_full = (1.0 - ratio) * xt_metar_full + ratio * x0_metar_full
+        xt_metar_full = (1.0 - ratio) * xt_metar_full + ratio * x0_metar_step
 
     if use_residual:
         g_rmask = _build_grid_residual_mask(device).squeeze(0)
