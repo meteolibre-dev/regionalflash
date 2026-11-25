@@ -29,7 +29,7 @@ from regionalflash.dataset import (
     SAT_STD,
     RegionalFlashMultimodalDataset,
 )
-from regionalflash.flow import sample_tiled_europe
+from regionalflash.flow import project_ar_feedback, sample_tiled_europe
 from regionalflash.model import RegionalFlashJiT3D
 
 log = logging.getLogger(__name__)
@@ -102,12 +102,16 @@ def _plot_grid(
     ir11_i: int,
 ) -> None:
     ir_mean, ir_std = float(SAT_MEAN[8]), float(SAT_STD[8])
-    lsm_z = lsm[yslice, xslice]
-    orog_z = orog[yslice, xslice]
+    h_span = (yslice.stop or lsm.shape[0]) - (yslice.start or 0)
+    pstep = 2 if h_span > 512 else 1
+    ys = slice(yslice.start, yslice.stop, pstep)
+    xs = slice(xslice.start, xslice.stop, pstep)
+    lsm_z = lsm[ys, xs]
+    orog_z = orog[ys, xs]
 
     # Auto-calibrate IR11 colormap from observed valid pixels
-    ref_ir = (gt_grids[1][ir11_i] * ir_std + ir_mean)[yslice, xslice]
-    ref_sm = gt_s_masks[1][0][yslice, xslice] > 0.5
+    ref_ir = (gt_grids[1][ir11_i] * ir_std + ir_mean)[ys, xs]
+    ref_sm = gt_s_masks[1][0][ys, xs] > 0.5
     if ref_sm.any():
         ir_vmin, ir_vmax = np.percentile(ref_ir[ref_sm], [1, 99])
     else:
@@ -117,10 +121,10 @@ def _plot_grid(
     for col, step in enumerate(show_steps):
         lead_h = 3 * (step + 1)
         t_str = str(ts_df.loc[start_idx + step + 1, "timestamp_utc"])[5:16]
-        gt_dbz = (gt_grids[step + 1][rad_i] * RADAR_SCALE)[yslice, xslice]
-        pr_dbz = (pred_grids[step, rad_i] * RADAR_SCALE)[yslice, xslice]
-        gt_ir = (gt_grids[step + 1][ir11_i] * ir_std + ir_mean)[yslice, xslice]
-        pr_ir = (pred_grids[step, ir11_i] * ir_std + ir_mean)[yslice, xslice]
+        gt_dbz = (gt_grids[step + 1][rad_i] * RADAR_SCALE)[ys, xs]
+        pr_dbz = (pred_grids[step, rad_i] * RADAR_SCALE)[ys, xs]
+        gt_ir = (gt_grids[step + 1][ir11_i] * ir_std + ir_mean)[ys, xs]
+        pr_ir = (pred_grids[step, ir11_i] * ir_std + ir_mean)[ys, xs]
 
         for r_i, (arr, stitle) in enumerate([
             (gt_dbz, f"+{lead_h}h ({t_str})\nOBS Radar (dBZ)"),
@@ -256,10 +260,16 @@ def main() -> None:
                     use_residual=True,
                     seed=1000 + mem * 100 + step,
                 )
-            cur_g = pred_g.float()
-            cur_m = pred_m.float()
-            ens_grids[mem, step] = cur_g.cpu().numpy()
-            ens_metars[mem, step] = cur_m.cpu().numpy()
+            pred_g_f = pred_g.float()
+            pred_m_f = pred_m.float()
+            ens_grids[mem, step] = pred_g_f.cpu().numpy()
+            ens_metars[mem, step] = pred_m_f.cpu().numpy()
+            # On-manifold AR feedback (ported from FlashEdges):
+            # clamp CERRA/Sat/Radar/METAR, zero off-coverage sat & radar, and
+            # re-sparsify METAR back to station pixels so steps 2+ stay on-manifold.
+            sm_next = torch.from_numpy(gt_s_masks[step + 1]).to(device)
+            rm_next = torch.from_numpy(gt_r_masks[step + 1]).to(device)
+            cur_g, cur_m = project_ar_feedback(pred_g_f, pred_m_f, sm_next, rm_next, cur_mm)
             log.info("  member %d/%d | step %d/%d (+%02dh) done", mem + 1, args.n_members, step + 1, args.lead_steps, 3 * (step + 1))
 
     t2m_i = config.DYN_CHANNELS.index("t2m")

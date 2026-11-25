@@ -374,8 +374,8 @@ def sample_tiled_europe(
                 acc_metar[:, y0:y1, x0:x1] += x0_m[ti] * win
                 acc_w[:, y0:y1, x0:x1] += win
 
-        x0_grid_full = acc_grid / acc_w
-        x0_metar_full = acc_metar / acc_w
+        x0_grid_full = torch.nan_to_num(acc_grid / acc_w, nan=0.0, posinf=8.0, neginf=-8.0)
+        x0_metar_full = torch.nan_to_num(acc_metar / acc_w, nan=0.0, posinf=10.0, neginf=-6.0)
         xt_grid_full = (1.0 - ratio) * xt_grid_full + ratio * x0_grid_full
         xt_metar_full = (1.0 - ratio) * xt_metar_full + ratio * x0_metar_full
 
@@ -388,3 +388,38 @@ def sample_tiled_europe(
         pred_grid_full, pred_metar_full = xt_grid_full, xt_metar_full
 
     return pred_grid_full, pred_metar_full
+
+
+@torch.no_grad()
+def project_ar_feedback(
+    pred_grid: torch.Tensor,
+    pred_metar: torch.Tensor,
+    sat_mask: torch.Tensor,
+    radar_mask: torch.Tensor,
+    metar_station_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project predicted (grid, metar) back onto the exact training context manifold for AR rollouts.
+
+    Matches `dataset.py` normalization & FlashEdges `inference_engine.py` on-manifold AR feedback:
+      - CERRA (0:57): clamp to [-8, 8]
+      - SatWeave (57:68): clamp to [-5, 5] and zero outside `sat_mask`
+      - OPERA Radar (68:69): clamp to [0, 4] and zero outside `radar_mask`
+      - METAR (0:6): clamp to [-6, 10] and re-sparsify to `metar_station_mask`
+        (zeroing non-station pixels so AR steps 2+ stay on the sparse training manifold)
+    Works on both unbatched (C, H, W) and batched (B, C, H, W) tensors.
+    """
+    g = torch.nan_to_num(pred_grid, nan=0.0).clone()
+    m = torch.nan_to_num(pred_metar, nan=0.0).clone()
+
+    sm = (sat_mask > 0.5)
+    rm = (radar_mask > 0.5)
+    mm = (metar_station_mask > 0.5)
+
+    g[..., :C_CERRA, :, :] = g[..., :C_CERRA, :, :].clamp(-8.0, 8.0)
+    sat_slice = g[..., C_CERRA : C_CERRA + C_SAT, :, :].clamp(-5.0, 5.0)
+    g[..., C_CERRA : C_CERRA + C_SAT, :, :] = torch.where(sm, sat_slice, torch.zeros_like(sat_slice))
+    rad_slice = g[..., C_CERRA + C_SAT :, :, :].clamp(0.0, 4.0)
+    g[..., C_CERRA + C_SAT :, :, :] = torch.where(rm, rad_slice, torch.zeros_like(rad_slice))
+
+    m = torch.where(mm, m.clamp(-6.0, 10.0), torch.zeros_like(m))
+    return g, m
