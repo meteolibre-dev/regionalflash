@@ -106,26 +106,29 @@ def trainer_step(
 
     B, _, H, W = grid_ctx.shape
 
+    # METAR context station dropout BEFORE building x0 targets so dropped stations
+    # cleanly supervise absolute target values (matching unseen-location spatial fill at inference)
+    metar_ctx_in = metar_ctx
+    met_m_ctx_in = met_m_ctx.bool()
+    met_any_ctx = met_m_ctx_in.any(dim=1, keepdim=True)  # (B, 1, H, W)
+    if metar_drop_frac > 0.0 and model.training:
+        drop = (torch.rand(B, 1, H, W, device=device) < metar_drop_frac) & met_any_ctx
+        if drop.any():
+            metar_ctx_in = torch.where(drop, torch.zeros_like(metar_ctx), metar_ctx)
+            met_m_ctx_in = met_m_ctx_in & ~drop
+            met_any_ctx = met_any_ctx & ~drop
+
     # Build clean x0 targets (residual for CERRA + slow METAR vars, absolute for Sat/Radar/fast METAR)
     if use_residual:
         g_rmask = _build_grid_residual_mask(device)
         m_rmask = _build_metar_residual_mask(device)
         x0_grid = torch.where(g_rmask, grid_tgt - grid_ctx, grid_tgt)
-        # Only take METAR residual where context station is also valid (else fallback to absolute)
-        both_valid = met_m_ctx.bool() & met_m_tgt.bool()
-        x0_metar = torch.where(m_rmask & both_valid, metar_tgt - metar_ctx, metar_tgt)
+        # Only take METAR residual where context station is still valid after dropout (else absolute)
+        both_valid = met_m_ctx_in & met_m_tgt.bool()
+        x0_metar = torch.where(m_rmask & both_valid, metar_tgt - metar_ctx_in, metar_tgt)
     else:
         x0_grid = grid_tgt
         x0_metar = metar_tgt
-
-    # METAR context station dropout (teaches spatial interpolation to unseen airports)
-    metar_ctx_in = metar_ctx
-    met_any_ctx = met_m_ctx.any(dim=1, keepdim=True)  # (B, 1, H, W)
-    if metar_drop_frac > 0.0 and model.training:
-        drop = (torch.rand(B, 1, H, W, device=device) < metar_drop_frac) & met_any_ctx
-        if drop.any():
-            metar_ctx_in = torch.where(drop, torch.zeros_like(metar_ctx), metar_ctx)
-            met_any_ctx = met_any_ctx & ~drop
 
     # Stratified 32-bin flow time t in [0, 1]
     n_bins = 32
@@ -307,6 +310,8 @@ def sample_tiled_europe(
     use_residual: bool = True,
     seed: int = 42,
     landcover_full: torch.Tensor | None = None,
+    sat_mask_tgt_full: torch.Tensor | None = None,
+    radar_mask_tgt_full: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Multi-Diffusion / Tiled Diffusion over the full 1069x1069 European grid.
 
@@ -316,6 +321,8 @@ def sample_tiled_europe(
     """
     device = grid_ctx_full.device
     _, H_full, W_full = grid_ctx_full.shape
+    sm_tgt_full = sat_mask_tgt_full if sat_mask_tgt_full is not None else sat_mask_full
+    rm_tgt_full = radar_mask_tgt_full if radar_mask_tgt_full is not None else radar_mask_full
 
     ys = list(range(0, H_full - patch_size + 1, stride))
     if ys[-1] != H_full - patch_size:
@@ -352,15 +359,17 @@ def sample_tiled_europe(
                 y1, x1 = y0 + patch_size, x0 + patch_size
                 g0 = grid_ctx_full[:, y0:y1, x0:x1]
                 m0 = metar_ctx_full[:, y0:y1, x0:x1]
-                sm = sat_mask_full[:, y0:y1, x0:x1]
-                rm = radar_mask_full[:, y0:y1, x0:x1]
+                sm0 = sat_mask_full[:, y0:y1, x0:x1]
+                rm0 = radar_mask_full[:, y0:y1, x0:x1]
+                sm1 = sm_tgt_full[:, y0:y1, x0:x1]
+                rm1 = rm_tgt_full[:, y0:y1, x0:x1]
                 ma = met_any_full[:, y0:y1, x0:x1]
                 st = static_full[:, y0:y1, x0:x1]
                 gn = xt_grid_full[:, y0:y1, x0:x1]
                 mn = xt_metar_full[:, y0:y1, x0:x1]
 
-                f0_list.append(torch.cat([g0, m0, sm, rm, ma, st], dim=0))
-                f1_list.append(torch.cat([gn, mn, sm, rm, ma, st], dim=0))
+                f0_list.append(torch.cat([g0, m0, sm0, rm0, ma, st], dim=0))
+                f1_list.append(torch.cat([gn, mn, sm1, rm1, ma, st], dim=0))
                 cm_list.append(m0)
                 nm_list.append(mn)
                 cmm_list.append(ma)
@@ -400,12 +409,12 @@ def sample_tiled_europe(
 
         # On-manifold forcing (FlashEdges): zero off-coverage SatWeave & OPERA Radar x0 at every step
         x0_grid_full[C_CERRA : C_CERRA + C_SAT] = torch.where(
-            sat_mask_full > 0.5,
+            sm_tgt_full > 0.5,
             x0_grid_full[C_CERRA : C_CERRA + C_SAT],
             torch.zeros_like(x0_grid_full[C_CERRA : C_CERRA + C_SAT]),
         )
         x0_grid_full[C_CERRA + C_SAT :] = torch.where(
-            radar_mask_full > 0.5,
+            rm_tgt_full > 0.5,
             x0_grid_full[C_CERRA + C_SAT :],
             torch.zeros_like(x0_grid_full[C_CERRA + C_SAT :]),
         )

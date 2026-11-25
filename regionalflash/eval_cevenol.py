@@ -174,6 +174,9 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     c_args = ckpt.get("args", {})
+    ema_sd = ckpt["ema"]
+    lc_w = ema_sd.get("landcover_embed.soft_emb.0.weight")
+    c_landcover = int(lc_w.shape[1]) if lc_w is not None else 0
     model = RegionalFlashJiT3D(
         img_size=(config.PATCH_SIZE, config.PATCH_SIZE),
         patch_size=(1, c_args.get("patch_xy", 8), c_args.get("patch_xy", 8)),
@@ -181,15 +184,18 @@ def main() -> None:
         depth=c_args.get("depth", 12),
         num_heads=c_args.get("num_heads", 16),
         kv_ctx_noise=0.0,
+        c_landcover=c_landcover,
     ).to(device)
-    model.load_state_dict(ckpt["ema"])
+    model.load_state_dict(ema_sd)
     model.eval()
     log.info(
-        "Loaded EMA checkpoint %s (epoch=%s, best_val=%.4f)",
-        args.ckpt, ckpt.get("epoch"), ckpt.get("best_val", float("nan")),
+        "Loaded EMA checkpoint %s (epoch=%s, best_val=%.4f, landcover=%d)",
+        args.ckpt, ckpt.get("epoch"), ckpt.get("best_val", float("nan")), c_landcover,
     )
 
     ds = RegionalFlashMultimodalDataset(args.data_dir, split=args.split, random_crop=False)
+    if c_landcover > 0 and ds.landcover is None:
+        raise FileNotFoundError(f"Checkpoint expects c_landcover={c_landcover}, but landcover_5km.zarr was not found in {args.data_dir}")
     ts_df = pd.read_parquet(Path(args.data_dir) / "timestamps.parquet")
 
     cy, cx = 418, 474
@@ -202,6 +208,11 @@ def main() -> None:
     )
 
     static_sub = torch.from_numpy(ds.static[:, y0 : y0 + S, x0 : x0 + S]).to(device)
+    landcover_sub = (
+        torch.from_numpy(ds.landcover[:, y0 : y0 + S, x0 : x0 + S]).to(device)
+        if c_landcover > 0 and ds.landcover is not None
+        else None
+    )
     lat_sub = torch.from_numpy(ds.lat[y0 : y0 + S, x0 : x0 + S]).to(device)
     lon_sub = torch.from_numpy(ds.lon[y0 : y0 + S, x0 : x0 + S]).to(device)
     lsm_sub = ds.static[1, y0 : y0 + S, x0 : x0 + S]
@@ -237,6 +248,8 @@ def main() -> None:
             t_cur = args.start_idx + step
             sm_t = torch.from_numpy(gt_s_masks[step]).to(device)
             rm_t = torch.from_numpy(gt_r_masks[step]).to(device)
+            sm_next = torch.from_numpy(gt_s_masks[step + 1]).to(device)
+            rm_next = torch.from_numpy(gt_r_masks[step + 1]).to(device)
             tf = torch.from_numpy(ds.time_feats[t_cur]).to(device)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
@@ -259,6 +272,9 @@ def main() -> None:
                     tile_batch_size=args.tile_batch_size,
                     use_residual=True,
                     seed=1000 + mem * 100 + step,
+                    landcover_full=landcover_sub,
+                    sat_mask_tgt_full=sm_next,
+                    radar_mask_tgt_full=rm_next,
                 )
             pred_g_f = pred_g.float()
             pred_m_f = pred_m.float()
@@ -267,8 +283,6 @@ def main() -> None:
             # On-manifold AR feedback (ported from FlashEdges):
             # clamp CERRA/Sat/Radar/METAR, zero off-coverage sat & radar, and
             # re-sparsify METAR back to station pixels so steps 2+ stay on-manifold.
-            sm_next = torch.from_numpy(gt_s_masks[step + 1]).to(device)
-            rm_next = torch.from_numpy(gt_r_masks[step + 1]).to(device)
             cur_g, cur_m = project_ar_feedback(pred_g_f, pred_m_f, sm_next, rm_next, cur_mm)
             log.info("  member %d/%d | step %d/%d (+%02dh) done", mem + 1, args.n_members, step + 1, args.lead_steps, 3 * (step + 1))
 
@@ -287,8 +301,8 @@ def main() -> None:
         gt_g = gt_grids[step + 1]
         rm = gt_r_masks[step + 1][0] > 0.5
 
-        gt_t2m = gt_g[t2m_i] * t2m_std + t2m_mean - 273.15
-        pr_t2m = mean_grids[step, t2m_i] * t2m_std + t2m_mean - 273.15
+        gt_t2m = gt_g[t2m_i] * t2m_std + t2m_mean
+        pr_t2m = mean_grids[step, t2m_i] * t2m_std + t2m_mean
 
         gt_dbz = gt_g[rad_i] * RADAR_SCALE
         pr_dbz = ens_grids[0, step, rad_i] * RADAR_SCALE

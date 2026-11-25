@@ -298,15 +298,26 @@ class AtmosphericPatchEmbed(nn.Module):
         # METAR (6 ch): [tmpc, dwpc, mslp_anom, u10, v10, p01m]
         self.register_buffer("metar_var_ids", torch.tensor([0, 1, 4, 2, 3, 6], dtype=torch.long), persistent=False)
 
-        # Per-channel shared spatial patch projector (1 ch -> d_sub) modulated by variable-family emb
+        # Per-channel shared spatial patch projector (1 ch -> d_sub) modulated by variable-family
+        # + per-channel embeddings via FiLM + SiLU + learned cross-channel attention pooling
+        # (non-linear so channels are never linearly collapsed by mean-pooling).
+        self.sfc_ch_emb = nn.Embedding(7, d_sub)
+        self.metar_ch_emb = nn.Embedding(6, d_sub)
         self.sfc_patch = nn.Conv2d(1, d_sub, kernel_size=(ph, pw), stride=(ph, pw))
+        self.sfc_film = nn.Linear(d_sub, 2 * d_sub)
+        self.sfc_attn_score = nn.Linear(d_sub, 1)
         self.sfc_mod_emb = nn.Parameter(torch.zeros(1, 1, d_sub))
+
         self.metar_patch = nn.Conv2d(1, d_sub, kernel_size=(ph, pw), stride=(ph, pw))
+        self.metar_film = nn.Linear(d_sub, 2 * d_sub)
+        self.metar_attn_score = nn.Linear(d_sub, 1)
         self.metar_mask_patch = nn.Conv2d(1, d_sub, kernel_size=(ph, pw), stride=(ph, pw))
         self.metar_mod_emb = nn.Parameter(torch.zeros(1, 1, d_sub))
 
         # --- 3. Spectral SatWeave (11 bands + mask) with sinusoidal log-wavelength embedding ---
         self.sat_patch = nn.Conv2d(1, d_sub, kernel_size=(ph, pw), stride=(ph, pw))
+        self.sat_film = nn.Linear(d_sub, 2 * d_sub)
+        self.sat_attn_score = nn.Linear(d_sub, 1)
         self.sat_mask_patch = nn.Conv2d(1, d_sub, kernel_size=(ph, pw), stride=(ph, pw))
         self.register_buffer("wave_emb", _sinusoidal_1d_emb(self.wavelengths, d_sub), persistent=False)
         self.wave_proj = nn.Linear(d_sub, d_sub)
@@ -325,17 +336,22 @@ class AtmosphericPatchEmbed(nn.Module):
         x_ch: torch.Tensor,
         conv: nn.Conv2d,
         ch_emb: torch.Tensor,
+        film_proj: nn.Linear,
+        attn_score: nn.Linear,
         mod_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply shared spatial conv to each channel independently, add physical emb, mean-pool."""
+        """Apply shared spatial conv per channel, FiLM-modulate with physical emb, SiLU, and attention-pool."""
         BT, C, H, W = x_ch.shape
         tok = conv(x_ch.reshape(BT * C, 1, H, W))           # (BT*C, D, Hp, Wp)
         D, Hp, Wp = tok.shape[1], tok.shape[2], tok.shape[3]
         tok = tok.reshape(BT, C, D, Hp * Wp).permute(0, 3, 1, 2)  # (BT, N, C, D)
-        tok = tok + ch_emb.view(1, 1, C, D)
+        shift, scale = film_proj(ch_emb).chunk(2, dim=-1)   # each (C, D)
+        tok = tok * (1.0 + scale.view(1, 1, C, D)) + shift.view(1, 1, C, D) + ch_emb.view(1, 1, C, D)
         if mod_bias is not None:
             tok = tok + mod_bias.view(1, 1, 1, D)
-        return tok.mean(dim=2)  # (BT, N, D)
+        tok = F.silu(tok)
+        attn_w = torch.softmax(attn_score(tok), dim=2)      # (BT, N, C, 1)
+        return (tok * attn_w).sum(dim=2)                    # (BT, N, D)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 84, T=2, H, W) -> tokens: (B, T * Hp * Wp, embed_dim)."""
@@ -367,17 +383,23 @@ class AtmosphericPatchEmbed(nn.Module):
         attn_w = torch.softmax(self.air_attn_score(air_tok), dim=2)      # (BT, N, L, 1)
         tok_air = self.air_out((air_tok * attn_w).sum(dim=2))            # (BT, N, d_air)
 
-        # 2. CERRA surface & METAR sharing physical variable-family embeddings
-        sfc_emb = self.var_family_emb(self.sfc_var_ids)
-        tok_sfc = self._embed_grouped_2d(sfc, self.sfc_patch, sfc_emb, self.sfc_mod_emb)
+        # 2. CERRA surface & METAR sharing physical variable-family embeddings (+ unique per-channel emb)
+        sfc_emb = self.var_family_emb(self.sfc_var_ids) + self.sfc_ch_emb.weight
+        tok_sfc = self._embed_grouped_2d(
+            sfc, self.sfc_patch, sfc_emb, self.sfc_film, self.sfc_attn_score, self.sfc_mod_emb
+        )
 
-        met_emb = self.var_family_emb(self.metar_var_ids)
-        tok_met = self._embed_grouped_2d(metar, self.metar_patch, met_emb, self.metar_mod_emb)
+        met_emb = self.var_family_emb(self.metar_var_ids) + self.metar_ch_emb.weight
+        tok_met = self._embed_grouped_2d(
+            metar, self.metar_patch, met_emb, self.metar_film, self.metar_attn_score, self.metar_mod_emb
+        )
         tok_met = tok_met + self.metar_mask_patch(met_m).flatten(2).transpose(1, 2)
 
         # 3. SatWeave with sinusoidal log-wavelength embeddings
         wave_e = self.wave_proj(self.wave_emb.to(xf.dtype))
-        tok_sat = self._embed_grouped_2d(sat, self.sat_patch, wave_e)
+        tok_sat = self._embed_grouped_2d(
+            sat, self.sat_patch, wave_e, self.sat_film, self.sat_attn_score
+        )
         tok_sat = tok_sat + self.sat_mask_patch(sat_m).flatten(2).transpose(1, 2)
 
         # 4. Radar & Static

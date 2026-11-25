@@ -22,7 +22,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from . import config
-from .dataset import METAR_STD, RegionalFlashMultimodalDataset
+from .dataset import METAR_STD, RegionalFlashMultimodalDataset, seed_worker
 from .flow import sample_next_step, trainer_step
 from .model import RegionalFlashJiT3D
 
@@ -212,6 +212,7 @@ def main() -> None:
         drop_last=True,
         persistent_workers=(args.num_workers > 0),
         prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
+        worker_init_fn=(seed_worker if args.num_workers > 0 else None),
     )
     val_workers = min(4, max(2, args.num_workers // 2)) if args.num_workers > 0 else 0
     val_loader = DataLoader(
@@ -221,6 +222,7 @@ def main() -> None:
         num_workers=val_workers,
         pin_memory=True,
         prefetch_factor=(1 if val_workers > 0 else None),
+        worker_init_fn=(seed_worker if val_workers > 0 else None),
     )
 
     c_landcover = int(train_ds.landcover.shape[0]) if train_ds.landcover is not None else 0

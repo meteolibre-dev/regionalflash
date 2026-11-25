@@ -105,7 +105,8 @@ class RegionalFlashMultimodalDataset:
         self.patch_size = patch_size
         self.random_crop = (split == "train") if random_crop is None else random_crop
         self.samples_per_epoch = samples_per_epoch
-        self.rng = np.random.default_rng(seed)
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(self.seed)
 
         # 1. Open all available half-year CERRA stores
         self.cerra_arrays: dict[str, zarr.Array] = {}
@@ -309,3 +310,13 @@ class RegionalFlashMultimodalDataset:
         if self.landcover is not None:
             sample["landcover"] = self.landcover[:, y0 : y0 + P, x0 : x0 + P]
         return sample
+
+
+def seed_worker(worker_id: int) -> None:
+    """Give each PyTorch DataLoader worker an independent NumPy RNG stream."""
+    import torch
+
+    info = torch.utils.data.get_worker_info()
+    if info is not None and hasattr(info.dataset, "rng"):
+        base_seed = int(getattr(info.dataset, "seed", 42))
+        info.dataset.rng = np.random.default_rng(np.random.SeedSequence([base_seed, int(worker_id)]))
