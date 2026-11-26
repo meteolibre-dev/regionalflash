@@ -100,6 +100,7 @@ class RegionalFlashMultimodalDataset:
         random_crop: bool | None = None,
         samples_per_epoch: int | None = None,
         seed: int = 42,
+        shard_reuse: int = 1,
     ) -> None:
         root = Path(data_dir)
         self.patch_size = patch_size
@@ -107,6 +108,10 @@ class RegionalFlashMultimodalDataset:
         self.samples_per_epoch = samples_per_epoch
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
+        self.shard_reuse = max(1, int(shard_reuse))
+        self._shard_rem = 0
+        self._shard_anchor_lo = 0
+        self._shard_anchor_hi = 1
 
         # 1. Open all available half-year CERRA stores
         self.cerra_arrays: dict[str, zarr.Array] = {}
@@ -250,7 +255,21 @@ class RegionalFlashMultimodalDataset:
     def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
         P = self.patch_size
         if self.random_crop:
-            t0 = int(self.anchors[int(self.rng.integers(0, len(self.anchors)))])
+            if self.shard_reuse > 1:
+                if self._shard_rem <= 0:
+                    # Pick a random 16-step Zarr temporal shard block and reuse it `shard_reuse` times
+                    # (massive OS page-cache hit rate for 256x256 crops while remaining uniform over the epoch)
+                    n_anc = len(self.anchors)
+                    ai = int(self.rng.integers(0, n_anc))
+                    lo = (ai // 16) * 16
+                    hi = min(n_anc, lo + 16)
+                    self._shard_anchor_lo = lo
+                    self._shard_anchor_hi = hi
+                    self._shard_rem = self.shard_reuse
+                self._shard_rem -= 1
+                t0 = int(self.anchors[int(self.rng.integers(self._shard_anchor_lo, self._shard_anchor_hi))])
+            else:
+                t0 = int(self.anchors[int(self.rng.integers(0, len(self.anchors)))])
             y0 = int(self.rng.integers(0, self.ny - P + 1))
             x0 = int(self.rng.integers(0, self.nx - P + 1))
         else:

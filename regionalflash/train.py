@@ -184,6 +184,7 @@ def main() -> None:
     p.add_argument("--noise-rho", type=float, default=0.0)
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--prefetch-factor", type=int, default=1)
+    p.add_argument("--shard-reuse", type=int, default=1, help="Reuse a 16-step Zarr temporal shard N times per worker for faster 256x256 I/O")
     p.add_argument("--compile", action="store_true", help="Use torch.compile on model")
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--init-from", type=Path, default=None, help="Warm-start model+EMA weights (strict=False) with fresh optimizer")
@@ -197,7 +198,12 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
 
     train_ds = RegionalFlashMultimodalDataset(
-        args.data_dir, split="train", patch_size=args.img_size, random_crop=True, samples_per_epoch=args.train_samples_per_epoch
+        args.data_dir,
+        split="train",
+        patch_size=args.img_size,
+        random_crop=True,
+        samples_per_epoch=args.train_samples_per_epoch,
+        shard_reuse=args.shard_reuse,
     )
     val_ds = RegionalFlashMultimodalDataset(
         args.data_dir, split="val", patch_size=args.img_size, random_crop=True, samples_per_epoch=args.val_samples, seed=123
