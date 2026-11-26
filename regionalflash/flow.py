@@ -312,6 +312,7 @@ def sample_tiled_europe(
     landcover_full: torch.Tensor | None = None,
     sat_mask_tgt_full: torch.Tensor | None = None,
     radar_mask_tgt_full: torch.Tensor | None = None,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Multi-Diffusion / Tiled Diffusion over the full 1069x1069 European grid.
 
@@ -338,8 +339,13 @@ def sample_tiled_europe(
 
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
-    xt_grid_full = torch.randn((C_GRID, H_full, W_full), device=device, dtype=grid_ctx_full.dtype, generator=gen)
-    xt_metar_full = torch.randn((C_METAR, H_full, W_full), device=device, dtype=metar_ctx_full.dtype, generator=gen)
+    if deterministic:
+        xt_grid_full = torch.zeros((C_GRID, H_full, W_full), device=device, dtype=grid_ctx_full.dtype)
+        xt_metar_full = torch.zeros((C_METAR, H_full, W_full), device=device, dtype=metar_ctx_full.dtype)
+        n_steps = 1
+    else:
+        xt_grid_full = torch.randn((C_GRID, H_full, W_full), device=device, dtype=grid_ctx_full.dtype, generator=gen)
+        xt_metar_full = torch.randn((C_METAR, H_full, W_full), device=device, dtype=metar_ctx_full.dtype, generator=gen)
     met_any_full = metar_mask_full.any(dim=0, keepdim=True).float()
 
     ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device)

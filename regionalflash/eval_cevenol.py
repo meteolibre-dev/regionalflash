@@ -168,6 +168,7 @@ def main() -> None:
     p.add_argument("--domain-size", type=int, default=1069, help="Domain size (1069 = full Europe!)")
     p.add_argument("--stride", type=int, default=96)
     p.add_argument("--tile-batch-size", type=int, default=16)
+    p.add_argument("--deterministic", action="store_true", help="1-step STRATA deterministic mode (t=1.0, xt=0)")
     p.add_argument("--split", default="val", choices=["val", "test"])
     args = p.parse_args()
 
@@ -275,6 +276,7 @@ def main() -> None:
                     landcover_full=landcover_sub,
                     sat_mask_tgt_full=sm_next,
                     radar_mask_tgt_full=rm_next,
+                    deterministic=args.deterministic,
                 )
             pred_g_f = pred_g.float()
             pred_m_f = pred_m.float()
