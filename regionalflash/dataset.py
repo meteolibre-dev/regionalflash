@@ -320,3 +320,159 @@ def seed_worker(worker_id: int) -> None:
     if info is not None and hasattr(info.dataset, "rng"):
         base_seed = int(getattr(info.dataset, "seed", 42))
         info.dataset.rng = np.random.default_rng(np.random.SeedSequence([base_seed, int(worker_id)]))
+
+
+class RegionalFlashSequenceDataset(RegionalFlashMultimodalDataset):
+    """Multi-step `(max_steps + 1)`-frame sequence dataset for STRATA-style AR fine-tuning.
+
+    Reads `L = max_steps + 1` consecutive 3-hourly frames (`t0 .. t0 + max_steps`) for a
+    `128x128` patch in a single contiguous Zarr slice whenever all frames lie in the same
+    half-year store (almost identical I/O cost to 2-frame reads!).
+    """
+
+    def __init__(
+        self,
+        data_dir: str | Path,
+        split: str = "train",
+        max_steps: int = 4,
+        patch_size: int = config.PATCH_SIZE,
+        tile_stride: int = config.TILE_STRIDE,
+        random_crop: bool | None = None,
+        samples_per_epoch: int | None = None,
+        seed: int = 42,
+    ) -> None:
+        super().__init__(
+            data_dir=data_dir,
+            split=split,
+            patch_size=patch_size,
+            tile_stride=tile_stride,
+            random_crop=random_crop,
+            samples_per_epoch=samples_per_epoch,
+            seed=seed,
+        )
+        self.max_steps = int(max_steps)
+        # Filter anchors so all frames t0 .. t0 + max_steps are valid & in-split
+        valid_set = set(int(a) for a in self.anchors)
+        self.anchors = np.asarray(
+            [t0 for t0 in self.anchors if all((int(t0) + k) in valid_set for k in range(self.max_steps))],
+            dtype=np.int64,
+        )
+
+    def _read_cerra_seq(self, t0: int, L: int, y0: int, x0: int) -> np.ndarray:
+        y1, x1 = y0 + self.patch_size, x0 + self.patch_size
+        p_first = str(self.periods_by_t[t0])
+        p_last = str(self.periods_by_t[t0 + L - 1])
+        if p_first == p_last:
+            l0 = int(self.local_idx_by_t[t0])
+            raw = np.asarray(self.cerra_arrays[p_first][l0 : l0 + L, y0:y1, x0:x1, :], dtype=np.float32)
+        else:
+            frames = [
+                np.asarray(
+                    self.cerra_arrays[str(self.periods_by_t[t0 + k])][int(self.local_idx_by_t[t0 + k]), y0:y1, x0:x1, :],
+                    dtype=np.float32,
+                )
+                for k in range(L)
+            ]
+            raw = np.stack(frames, axis=0)
+        # (L, H, W, 57) -> (L, 57, H, W)
+        c = (np.transpose(raw, (0, 3, 1, 2)) - self.cerra_mean[None]) / self.cerra_std[None]
+        return np.clip(c, -8.0, 8.0)
+
+    def _read_sat_seq(self, t0: int, L: int, y0: int, x0: int) -> tuple[np.ndarray, np.ndarray]:
+        P = self.patch_size
+        p_first = str(self.periods_by_t[t0])
+        p_last = str(self.periods_by_t[t0 + L - 1])
+        if p_first == p_last and p_first in self.sat_arrays:
+            l0 = int(self.local_idx_by_t[t0])
+            raw = np.asarray(self.sat_arrays[p_first][l0 : l0 + L, y0 : y0 + P, x0 : x0 + P, :], dtype=np.float32)
+            vals = np.transpose(raw[..., :11], (0, 3, 1, 2))
+            mask = (raw[..., 11:12] > 0.5).transpose(0, 3, 1, 2).astype(np.float32)
+            norm = (vals - SAT_MEAN[None, :, None, None]) / SAT_STD[None, :, None, None]
+            norm = np.where(mask > 0.5, np.clip(norm, -5.0, 5.0), 0.0)
+            return norm, mask
+        s_list, m_list = [], []
+        for k in range(L):
+            sk, mk = self._read_sat_frame(t0 + k, y0, x0)
+            s_list.append(sk)
+            m_list.append(mk)
+        return np.stack(s_list, axis=0), np.stack(m_list, axis=0)
+
+    def _read_radar_seq(self, t0: int, L: int, y0: int, x0: int) -> tuple[np.ndarray, np.ndarray]:
+        P = self.patch_size
+        if self.radar_arr is None:
+            z = np.zeros((L, 1, P, P), dtype=np.float32)
+            return z, z
+        raw = np.asarray(self.radar_arr[t0 : t0 + L, y0 : y0 + P, x0 : x0 + P, :], dtype=np.float32)
+        mask = (raw[..., 1:2] > 0.5).transpose(0, 3, 1, 2).astype(np.float32)
+        rad = np.where(mask > 0.5, np.clip(raw[..., 0:1].transpose(0, 3, 1, 2) / RADAR_SCALE, 0.0, 4.0), 0.0)
+        return rad, mask
+
+    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
+        P = self.patch_size
+        L = self.max_steps + 1
+        if self.random_crop:
+            t0 = int(self.anchors[int(self.rng.integers(0, len(self.anchors)))])
+            y0 = int(self.rng.integers(0, self.ny - P + 1))
+            x0 = int(self.rng.integers(0, self.nx - P + 1))
+        else:
+            n_tiles = len(self.tile_coords)
+            t0 = int(self.anchors[idx // n_tiles])
+            y0, x0 = self.tile_coords[idx % n_tiles]
+
+        c_seq = self._read_cerra_seq(t0, L, y0, x0)            # (L, 57, P, P)
+        s_seq, sm_seq = self._read_sat_seq(t0, L, y0, x0)      # (L, 11, P, P), (L, 1, P, P)
+        r_seq, rm_seq = self._read_radar_seq(t0, L, y0, x0)    # (L, 1, P, P), (L, 1, P, P)
+        grid_seq = np.concatenate([c_seq, s_seq, r_seq], axis=1)  # (L, 69, P, P)
+
+        if self.metar_idx is not None:
+            m_list, mm_list = [], []
+            for k in range(L):
+                mk, mmk = self.metar_idx.rasterize_patch(t0 + k, y0, x0, P)
+                m_list.append(mk)
+                mm_list.append(mmk)
+            metar_seq = np.stack(m_list, axis=0)       # (L, 6, P, P)
+            metar_mask_seq = np.stack(mm_list, axis=0)  # (L, 6, P, P) bool
+        else:
+            metar_seq = np.zeros((L, 6, P, P), dtype=np.float32)
+            metar_mask_seq = np.zeros((L, 6, P, P), dtype=bool)
+
+        static_patch = self.static[:, y0 : y0 + P, x0 : x0 + P]
+        cy, cx = y0 + P // 2, x0 + P // 2
+        c_lat = float(self.lat[cy, cx])
+        c_lon = float(self.lon[cy, cx])
+        lat_norm = np.float32((c_lat - 48.0) / 15.0)
+        lon_norm = np.float32((c_lon - 10.0) / 25.0)
+
+        # Global conditioning for each transition step k = 0 .. max_steps - 1 (t0+k -> t0+k+1)
+        g_cond_seq = np.stack(
+            [
+                np.concatenate([
+                    self.time_feats[t0 + k],
+                    np.array([lat_norm, lon_norm], dtype=np.float32),
+                    solar_step_features(
+                        self.ctx_unix_s[t0 + k],
+                        self.tgt_unix_s[t0 + k],
+                        self.noon_unix_s[t0 + k],
+                        c_lon,
+                        c_lat,
+                    ),
+                ])
+                for k in range(self.max_steps)
+            ],
+            axis=0,
+        )  # (max_steps, 14)
+
+        sample = {
+            "grid_seq": grid_seq,
+            "metar_seq": metar_seq,
+            "sat_mask_seq": sm_seq,
+            "radar_mask_seq": rm_seq,
+            "metar_mask_seq": metar_mask_seq,
+            "static": static_patch,
+            "global_cond_seq": g_cond_seq,
+            "time_idx": np.int64(t0),
+            "yx": np.asarray([y0, x0], dtype=np.int64),
+        }
+        if self.landcover is not None:
+            sample["landcover"] = self.landcover[:, y0 : y0 + P, x0 : x0 + P]
+        return sample
