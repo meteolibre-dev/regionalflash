@@ -439,8 +439,9 @@ def main() -> None:
     p.add_argument("--data-dir", type=Path, default=config.PROCESSED_DIR)
     p.add_argument("--init-from", type=Path, required=True, help="Pretrained 1-step checkpoint (best.pt)")
     p.add_argument("--out-dir", type=Path, default=config.ROOT_DIR / "runs" / "jit3d_ar_ft")
-    p.add_argument("--ar-mode", choices=["flow_rollout", "strata_det", "diff_flow"], default="diff_flow")
+    p.add_argument("--ar-mode", choices=["flow_rollout", "strata_det", "diff_flow", "joint_strata_flow"], default="joint_strata_flow")
     p.add_argument("--max-steps", type=int, default=4, help="Max AR steps (4 = 12h rollout)")
+    p.add_argument("--strata-weight", type=float, default=0.5, help="Weight of CERRA+METAR multi-step STRATA Huber loss in joint_strata_flow")
     p.add_argument("--rollout-ode-steps", type=int, default=6, help="ODE steps during K-1 rollout in flow_rollout mode")
     p.add_argument("--diff-t-min", type=float, default=0.2, help="Min intermediate flow time t_1 ~ U(t_min, 1.0) in diff_flow mode")
     p.add_argument("--p-1step", type=float, default=0.25, help="Fraction of batches kept at K=1 anchor in flow_rollout")
@@ -531,13 +532,24 @@ def main() -> None:
     # Baseline 4-step AR evaluation before fine-tuning!
     base_val = evaluate_ar(ema_model, val_loader, device, args.max_steps, t2m_std, ar_mode=args.ar_mode)
     log.info(
-        "BASELINE (Ep 00) AR VAL | CERRA T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C | "
+        "BASELINE (Ep 00) AR VAL (%s) | CERRA T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C | "
         "METAR T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C",
+        "det" if args.ar_mode == "strata_det" else "ode12",
         base_val.get("cerra_t2m_3h", float("nan")), base_val.get("cerra_t2m_6h", float("nan")),
         base_val.get("cerra_t2m_9h", float("nan")), base_val.get("cerra_t2m_12h", float("nan")),
         base_val.get("metar_t2m_3h", float("nan")), base_val.get("metar_t2m_6h", float("nan")),
         base_val.get("metar_t2m_9h", float("nan")), base_val.get("metar_t2m_12h", float("nan")),
     )
+    if args.ar_mode == "joint_strata_flow":
+        base_det = evaluate_ar(ema_model, val_loader, device, args.max_steps, t2m_std, ar_mode="strata_det")
+        log.info(
+            "BASELINE (Ep 00) AR VAL (det)   | CERRA T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C | "
+            "METAR T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C",
+            base_det.get("cerra_t2m_3h", float("nan")), base_det.get("cerra_t2m_6h", float("nan")),
+            base_det.get("cerra_t2m_9h", float("nan")), base_det.get("cerra_t2m_12h", float("nan")),
+            base_det.get("metar_t2m_3h", float("nan")), base_det.get("metar_t2m_6h", float("nan")),
+            base_det.get("metar_t2m_9h", float("nan")), base_det.get("metar_t2m_12h", float("nan")),
+        )
 
     for epoch in range(args.epochs):
         train_model.train()
@@ -545,7 +557,7 @@ def main() -> None:
         running: dict[str, float] = {}
 
         # STRATA Appendix E schedule: Stage 1 (N=2) for first ~47% of epochs, Stage 2 (N=4) for remainder
-        if args.ar_mode == "strata_det":
+        if args.ar_mode in ("strata_det", "joint_strata_flow"):
             cur_max_k = 2 if epoch < max(1, int(round(0.47 * args.epochs))) else args.max_steps
         else:
             cur_max_k = min(args.max_steps, 2 + int(epoch * (args.max_steps - 1) / max(int(0.4 * args.epochs), 1)))
@@ -561,7 +573,7 @@ def main() -> None:
                 pg["lr"] = lr
 
             # Sample horizon K for this batch
-            if args.ar_mode == "strata_det":
+            if args.ar_mode in ("strata_det", "joint_strata_flow"):
                 k_steps = cur_max_k
             elif torch.rand(1).item() < args.p_1step:
                 k_steps = 1
@@ -569,42 +581,91 @@ def main() -> None:
                 k_steps = int(torch.randint(2, cur_max_k + 1, (1,)).item())
 
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                if args.ar_mode == "flow_rollout":
-                    loss, metrics = _flow_rollout_step(
-                        train_model=train_model,
-                        rollout_model=ema_model,
-                        batch=batch,
-                        device=device,
-                        k_steps=k_steps,
-                        rollout_ode_steps=args.rollout_ode_steps,
+            if args.ar_mode == "joint_strata_flow":
+                # Sequential backward to keep peak VRAM identical to strata_det (~55 GB)!
+                clean_batch = {
+                    "grid_ctx": batch["grid_seq"][:, 0],
+                    "grid_tgt": batch["grid_seq"][:, 1],
+                    "metar_ctx": batch["metar_seq"][:, 0],
+                    "metar_tgt": batch["metar_seq"][:, 1],
+                    "sat_mask_ctx": batch["sat_mask_seq"][:, 0],
+                    "sat_mask_tgt": batch["sat_mask_seq"][:, 1],
+                    "radar_mask_ctx": batch["radar_mask_seq"][:, 0],
+                    "radar_mask_tgt": batch["radar_mask_seq"][:, 1],
+                    "metar_mask_ctx": batch["metar_mask_seq"][:, 0],
+                    "metar_mask_tgt": batch["metar_mask_seq"][:, 1],
+                    "static": batch["static"],
+                    "global_cond": batch["global_cond_seq"][:, 0],
+                }
+                if "landcover" in batch:
+                    clean_batch["landcover"] = batch["landcover"]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                    loss_flow, m_flow = trainer_step(
+                        train_model,
+                        clean_batch,
+                        device,
                         cerra_ch_weights=cerra_ch_weights,
+                        use_residual=True,
                         metar_drop_frac=args.metar_drop_frac,
                         noise_rho=args.noise_rho,
-                        step_seed=global_step * 17,
                     )
-                elif args.ar_mode == "diff_flow":
-                    loss, metrics = _diff_flow_step(
-                        model=train_model,
-                        batch=batch,
-                        device=device,
-                        k_steps=k_steps,
-                        diff_t_min=args.diff_t_min,
-                        cerra_ch_weights=cerra_ch_weights,
-                        metar_drop_frac=args.metar_drop_frac,
-                        noise_rho=args.noise_rho,
-                    )
-                else:
-                    loss, metrics = _strata_det_step(
+                loss_flow.backward()
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                    loss_ar, m_ar = _strata_det_step(
                         model=train_model,
                         batch=batch,
                         device=device,
                         k_steps=k_steps,
                         cerra_ch_weights=cerra_ch_weights,
                         huber_delta=args.huber_delta,
+                        sat_loss_weight=0.0,
+                        radar_loss_weight=0.0,
+                        metar_loss_weight=1.0,
                     )
-
-            loss.backward()
+                (args.strata_weight * loss_ar).backward()
+                metrics = {
+                    "loss": m_flow["loss"] + args.strata_weight * m_ar["loss"],
+                    "loss_cerra": m_flow["loss_cerra"],
+                    "loss_sat": m_flow["loss_sat"],
+                    "loss_radar": m_flow["loss_radar"],
+                    "loss_metar": m_ar["loss_metar"],
+                }
+            else:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                    if args.ar_mode == "flow_rollout":
+                        loss, metrics = _flow_rollout_step(
+                            train_model=train_model,
+                            rollout_model=ema_model,
+                            batch=batch,
+                            device=device,
+                            k_steps=k_steps,
+                            rollout_ode_steps=args.rollout_ode_steps,
+                            cerra_ch_weights=cerra_ch_weights,
+                            metar_drop_frac=args.metar_drop_frac,
+                            noise_rho=args.noise_rho,
+                            step_seed=global_step * 17,
+                        )
+                    elif args.ar_mode == "diff_flow":
+                        loss, metrics = _diff_flow_step(
+                            model=train_model,
+                            batch=batch,
+                            device=device,
+                            k_steps=k_steps,
+                            diff_t_min=args.diff_t_min,
+                            cerra_ch_weights=cerra_ch_weights,
+                            metar_drop_frac=args.metar_drop_frac,
+                            noise_rho=args.noise_rho,
+                        )
+                    else:
+                        loss, metrics = _strata_det_step(
+                            model=train_model,
+                            batch=batch,
+                            device=device,
+                            k_steps=k_steps,
+                            cerra_ch_weights=cerra_ch_weights,
+                            huber_delta=args.huber_delta,
+                        )
+                loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             update_ema(ema_model, model, args.ema_decay)
@@ -625,14 +686,26 @@ def main() -> None:
         lead_max = 3 * args.max_steps
         ar_score = val_ar[f"cerra_t2m_{lead_max}h"] + 0.5 * val_ar[f"metar_t2m_{lead_max}h"]
         log.info(
-            "AR Ep %02d DONE (%.1fs) | CERRA T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C | "
+            "AR Ep %02d DONE (%.1fs) [%s] | CERRA T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C | "
             "METAR T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C",
             epoch + 1, time.time() - t0_ep,
+            "det" if args.ar_mode == "strata_det" else "ode12",
             val_ar.get("cerra_t2m_3h", float("nan")), val_ar.get("cerra_t2m_6h", float("nan")),
             val_ar.get("cerra_t2m_9h", float("nan")), val_ar.get("cerra_t2m_12h", float("nan")),
             val_ar.get("metar_t2m_3h", float("nan")), val_ar.get("metar_t2m_6h", float("nan")),
             val_ar.get("metar_t2m_9h", float("nan")), val_ar.get("metar_t2m_12h", float("nan")),
         )
+        if args.ar_mode == "joint_strata_flow":
+            val_det = evaluate_ar(ema_model, val_loader, device, args.max_steps, t2m_std, ar_mode="strata_det")
+            log.info(
+                "AR Ep %02d VAL  [det]   | CERRA T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C | "
+                "METAR T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C",
+                epoch + 1,
+                val_det.get("cerra_t2m_3h", float("nan")), val_det.get("cerra_t2m_6h", float("nan")),
+                val_det.get("cerra_t2m_9h", float("nan")), val_det.get("cerra_t2m_12h", float("nan")),
+                val_det.get("metar_t2m_3h", float("nan")), val_det.get("metar_t2m_6h", float("nan")),
+                val_det.get("metar_t2m_9h", float("nan")), val_det.get("metar_t2m_12h", float("nan")),
+            )
 
         merged_args = {**c_args, **vars(args)}
         state = {
