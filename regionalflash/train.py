@@ -184,6 +184,7 @@ def main() -> None:
     p.add_argument("--noise-rho", type=float, default=0.0)
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--prefetch-factor", type=int, default=1)
+    p.add_argument("--mp-context", type=str, default="", help="DataLoader multiprocessing_context (e.g. 'spawn')")
     p.add_argument("--shard-reuse", type=int, default=1, help="Reuse a 16-step Zarr temporal shard N times per worker for faster 256x256 I/O")
     p.add_argument("--compile", action="store_true", help="Use torch.compile on model")
     p.add_argument("--resume", type=Path, default=None)
@@ -210,6 +211,7 @@ def main() -> None:
     )
     log.info("Loaded RegionalFlash dataset: %d train anchors, %d val anchors", len(train_ds.anchors), len(val_ds.anchors))
 
+    mp_ctx = args.mp_context if (args.mp_context and args.num_workers > 0) else None
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -220,6 +222,7 @@ def main() -> None:
         persistent_workers=(args.num_workers > 0),
         prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
         worker_init_fn=(seed_worker if args.num_workers > 0 else None),
+        multiprocessing_context=mp_ctx,
     )
     val_workers = min(4, max(2, args.num_workers // 2)) if args.num_workers > 0 else 0
     val_loader = DataLoader(
@@ -230,6 +233,7 @@ def main() -> None:
         pin_memory=True,
         prefetch_factor=(1 if val_workers > 0 else None),
         worker_init_fn=(seed_worker if val_workers > 0 else None),
+        multiprocessing_context=(args.mp_context if (args.mp_context and val_workers > 0) else None),
     )
 
     c_landcover = int(train_ds.landcover.shape[0]) if train_ds.landcover is not None else 0
@@ -314,7 +318,7 @@ def main() -> None:
             for k, v in metrics.items():
                 running[k] = running.get(k, 0.0) + v
 
-            if step_i % 50 == 0 or step_i == len(train_loader):
+            if step_i in (1, 10) or step_i % 50 == 0 or step_i == len(train_loader):
                 avg = {k: v / step_i for k, v in running.items()}
                 log.info(
                     "Ep %02d [%d/%d] lr=%.2e | loss=%.4f (cerra=%.4f sat=%.4f rad=%.4f metar=%.4f)",
