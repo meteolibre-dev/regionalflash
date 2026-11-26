@@ -234,6 +234,122 @@ def _flow_rollout_step(
     )
 
 
+def _diff_flow_step(
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    k_steps: int,
+    diff_ode_steps: int,
+    cerra_ch_weights: torch.Tensor | None,
+    metar_drop_frac: float,
+    noise_rho: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Differentiable Rollout Flow Matching (DRFM):
+      - For k_steps == 1: standard clean 1-step Rectified Flow anchor.
+      - For k_steps >= 2: unrolls K-1 steps with a differentiable `diff_ode_steps`-step
+        Euler ODE (default 2 steps: t=1.0 -> 0.5 -> 0.0, gradient-checkpointed, sharp
+        generative context + on-manifold AR feedback), then computes full Rectified Flow
+        x-prediction loss at random t in (0, 1) on step K WITH gradients flowing back
+        through pred_{K-1} into steps 1..K-1!
+    """
+    grid_seq = batch["grid_seq"].to(device, non_blocking=True)
+    metar_seq = batch["metar_seq"].to(device, non_blocking=True)
+    sat_m_seq = batch["sat_mask_seq"].to(device, non_blocking=True)
+    rad_m_seq = batch["radar_mask_seq"].to(device, non_blocking=True)
+    met_m_seq = batch["metar_mask_seq"].to(device, non_blocking=True)
+    static = batch["static"].to(device, non_blocking=True)
+    landcover = batch["landcover"].to(device, non_blocking=True) if "landcover" in batch else None
+    g_cond_seq = batch["global_cond_seq"].to(device, non_blocking=True)
+
+    B = grid_seq.shape[0]
+    g_rmask = _build_grid_residual_mask(device)
+    m_rmask = _build_metar_residual_mask(device)
+
+    cur_g = grid_seq[:, 0]
+    cur_m = metar_seq[:, 0]
+    cur_mm = met_m_seq[:, 0]
+    met_m0 = cur_mm.bool()
+    met_any0 = met_m0.any(dim=1, keepdim=True).float()
+
+    def _diff_euler_step(g_in, m_in, sm_c, sm_t, rm_c, rm_t, gc_base, eps_g, eps_m):
+        f0 = torch.cat([g_in, m_in, sm_c, rm_c, met_any0, static], dim=1)
+        xt_g, xt_m = eps_g, eps_m
+        ts = torch.linspace(1.0, 0.0, diff_ode_steps + 1, device=device)
+        for oi in range(diff_ode_steps):
+            t_cur = ts[oi]
+            t_nxt = ts[oi + 1]
+            t_vec = torch.full((B, 1), float(t_cur.item()), device=device, dtype=gc_base.dtype)
+            gc = torch.cat([gc_base, t_vec], dim=1)
+            f1 = torch.cat([xt_g, xt_m, sm_t, rm_t, met_any0, static], dim=1)
+            x_in = torch.stack([f0, f1], dim=2)
+            x0_g, x0_m = model(x_in, gc, m_in, xt_m, met_any0, static, landcover=landcover)
+
+            # On-manifold sat/radar forcing
+            x0_g = torch.cat([
+                x0_g[:, :C_CERRA],
+                torch.where(sm_t > 0.5, x0_g[:, C_CERRA : C_CERRA + C_SAT], torch.zeros_like(x0_g[:, C_CERRA : C_CERRA + C_SAT])),
+                torch.where(rm_t > 0.5, x0_g[:, C_CERRA + C_SAT :], torch.zeros_like(x0_g[:, C_CERRA + C_SAT :])),
+            ], dim=1)
+
+            if oi == diff_ode_steps - 1:
+                xt_g, xt_m = x0_g, x0_m
+            else:
+                x0_m_step = torch.where(met_any0 > 0.5, x0_m, torch.zeros_like(x0_m))
+                ratio = float(((t_cur - t_nxt) / t_cur.clamp(min=1e-5)).item())
+                xt_g = (1.0 - ratio) * xt_g + ratio * x0_g
+                xt_m = (1.0 - ratio) * xt_m + ratio * x0_m_step
+
+        pg = torch.where(g_rmask, xt_g + g_in, xt_g)
+        pm = torch.where(m_rmask & met_m0, xt_m + m_in, xt_m)
+        return pg, pm
+
+    for s in range(k_steps - 1):
+        sm_c, sm_t = sat_m_seq[:, s], sat_m_seq[:, s + 1]
+        rm_c, rm_t = rad_m_seq[:, s], rad_m_seq[:, s + 1]
+        gc_base = g_cond_seq[:, s]
+        eps_g = torch.randn_like(cur_g)
+        eps_m = torch.randn_like(cur_m)
+        pg, pm = checkpoint(
+            _diff_euler_step, cur_g, cur_m, sm_c, sm_t, rm_c, rm_t, gc_base, eps_g, eps_m,
+            use_reentrant=False,
+        )
+        # Differentiable on-manifold AR feedback
+        cur_g = torch.cat([
+            pg[:, :C_CERRA].clamp(-8.0, 8.0),
+            torch.where(sm_t > 0.5, pg[:, C_CERRA : C_CERRA + C_SAT].clamp(-5.0, 5.0), torch.zeros_like(pg[:, C_CERRA : C_CERRA + C_SAT])),
+            torch.where(rm_t > 0.5, pg[:, C_CERRA + C_SAT :].clamp(0.0, 4.0), torch.zeros_like(pg[:, C_CERRA + C_SAT :])),
+        ], dim=1)
+        cur_m = torch.where(met_m0, pm.clamp(-6.0, 10.0), torch.zeros_like(pm))
+
+    # Step K: full Rectified Flow x-prediction at random t in (0, 1) with gradients into cur_g/cur_m!
+    step_batch = {
+        "grid_ctx": cur_g,
+        "grid_tgt": grid_seq[:, k_steps],
+        "metar_ctx": cur_m,
+        "metar_tgt": metar_seq[:, k_steps],
+        "sat_mask_ctx": sat_m_seq[:, k_steps - 1],
+        "sat_mask_tgt": sat_m_seq[:, k_steps],
+        "radar_mask_ctx": rad_m_seq[:, k_steps - 1],
+        "radar_mask_tgt": rad_m_seq[:, k_steps],
+        "metar_mask_ctx": cur_mm,
+        "metar_mask_tgt": met_m_seq[:, k_steps],
+        "static": static,
+        "global_cond": g_cond_seq[:, k_steps - 1],
+    }
+    if landcover is not None:
+        step_batch["landcover"] = landcover
+
+    return trainer_step(
+        model,
+        step_batch,
+        device,
+        cerra_ch_weights=cerra_ch_weights,
+        use_residual=True,
+        metar_drop_frac=(metar_drop_frac if k_steps == 1 else 0.0),
+        noise_rho=noise_rho,
+    )
+
+
 @torch.no_grad()
 def evaluate_ar(
     model: torch.nn.Module,
@@ -330,9 +446,10 @@ def main() -> None:
     p.add_argument("--data-dir", type=Path, default=config.PROCESSED_DIR)
     p.add_argument("--init-from", type=Path, required=True, help="Pretrained 1-step checkpoint (best.pt)")
     p.add_argument("--out-dir", type=Path, default=config.ROOT_DIR / "runs" / "jit3d_ar_ft")
-    p.add_argument("--ar-mode", choices=["flow_rollout", "strata_det"], default="flow_rollout")
+    p.add_argument("--ar-mode", choices=["flow_rollout", "strata_det", "diff_flow"], default="diff_flow")
     p.add_argument("--max-steps", type=int, default=4, help="Max AR steps (4 = 12h rollout)")
     p.add_argument("--rollout-ode-steps", type=int, default=6, help="ODE steps during K-1 rollout in flow_rollout mode")
+    p.add_argument("--diff-ode-steps", type=int, default=2, help="Differentiable Euler ODE steps per rollout step in diff_flow mode")
     p.add_argument("--p-1step", type=float, default=0.25, help="Fraction of batches kept at K=1 anchor in flow_rollout")
     p.add_argument("--huber-delta", type=float, default=1.0, help="Huber delta in strata_det mode")
 
@@ -472,6 +589,17 @@ def main() -> None:
                         metar_drop_frac=args.metar_drop_frac,
                         noise_rho=args.noise_rho,
                         step_seed=global_step * 17,
+                    )
+                elif args.ar_mode == "diff_flow":
+                    loss, metrics = _diff_flow_step(
+                        model=train_model,
+                        batch=batch,
+                        device=device,
+                        k_steps=k_steps,
+                        diff_ode_steps=args.diff_ode_steps,
+                        cerra_ch_weights=cerra_ch_weights,
+                        metar_drop_frac=args.metar_drop_frac,
+                        noise_rho=args.noise_rho,
                     )
                 else:
                     loss, metrics = _strata_det_step(
