@@ -166,7 +166,7 @@ def main() -> None:
     p.add_argument("--n-members", type=int, default=1, help="Ensemble members")
     p.add_argument("--ode-steps", type=int, default=20)
     p.add_argument("--domain-size", type=int, default=1069, help="Domain size (1069 = full Europe!)")
-    p.add_argument("--stride", type=int, default=96)
+    p.add_argument("--stride", type=int, default=0, help="Tile stride (0 = auto 3/4 of model img_size)")
     p.add_argument("--tile-batch-size", type=int, default=16)
     p.add_argument("--deterministic", action="store_true", help="1-step STRATA deterministic mode (t=1.0, xt=0)")
     p.add_argument("--split", default="val", choices=["val", "test"])
@@ -178,8 +178,10 @@ def main() -> None:
     ema_sd = ckpt["ema"]
     lc_w = ema_sd.get("landcover_embed.soft_emb.0.weight")
     c_landcover = int(lc_w.shape[1]) if lc_w is not None else 0
+    tile_size = int(c_args.get("img_size", config.PATCH_SIZE))
+    stride = args.stride if args.stride > 0 else (3 * tile_size) // 4
     model = RegionalFlashJiT3D(
-        img_size=(config.PATCH_SIZE, config.PATCH_SIZE),
+        img_size=(tile_size, tile_size),
         patch_size=(1, c_args.get("patch_xy", 8), c_args.get("patch_xy", 8)),
         embed_dim=c_args.get("embed_dim", 1024),
         depth=c_args.get("depth", 12),
@@ -190,8 +192,8 @@ def main() -> None:
     model.load_state_dict(ema_sd)
     model.eval()
     log.info(
-        "Loaded EMA checkpoint %s (epoch=%s, best_val=%.4f, landcover=%d)",
-        args.ckpt, ckpt.get("epoch"), ckpt.get("best_val", float("nan")), c_landcover,
+        "Loaded EMA checkpoint %s (epoch=%s, best_val=%.4f, tile=%d, stride=%d, landcover=%d)",
+        args.ckpt, ckpt.get("epoch"), ckpt.get("best_val", float("nan")), tile_size, stride, c_landcover,
     )
 
     ds = RegionalFlashMultimodalDataset(args.data_dir, split=args.split, random_crop=False)
@@ -268,7 +270,8 @@ def main() -> None:
                     ctx_unix_s=float(ds.ctx_unix_s[t_cur]),
                     tgt_unix_s=float(ds.tgt_unix_s[t_cur]),
                     noon_unix_s=float(ds.noon_unix_s[t_cur]),
-                    stride=args.stride,
+                    patch_size=tile_size,
+                    stride=stride,
                     n_steps=args.ode_steps,
                     tile_batch_size=args.tile_batch_size,
                     use_residual=True,

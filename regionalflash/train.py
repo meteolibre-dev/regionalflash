@@ -163,6 +163,7 @@ def main() -> None:
     p.add_argument("--repo-id", default=config.HF_REPO_ID)
 
     # Model size
+    p.add_argument("--img-size", type=int, default=config.PATCH_SIZE, help="Spatial crop size (e.g. 128 or 256)")
     p.add_argument("--embed-dim", type=int, default=768)
     p.add_argument("--depth", type=int, default=12)
     p.add_argument("--num-heads", type=int, default=12)
@@ -196,10 +197,10 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
 
     train_ds = RegionalFlashMultimodalDataset(
-        args.data_dir, split="train", random_crop=True, samples_per_epoch=args.train_samples_per_epoch
+        args.data_dir, split="train", patch_size=args.img_size, random_crop=True, samples_per_epoch=args.train_samples_per_epoch
     )
     val_ds = RegionalFlashMultimodalDataset(
-        args.data_dir, split="val", random_crop=True, samples_per_epoch=args.val_samples, seed=123
+        args.data_dir, split="val", patch_size=args.img_size, random_crop=True, samples_per_epoch=args.val_samples, seed=123
     )
     log.info("Loaded RegionalFlash dataset: %d train anchors, %d val anchors", len(train_ds.anchors), len(val_ds.anchors))
 
@@ -227,7 +228,7 @@ def main() -> None:
 
     c_landcover = int(train_ds.landcover.shape[0]) if train_ds.landcover is not None else 0
     model = RegionalFlashJiT3D(
-        img_size=(config.PATCH_SIZE, config.PATCH_SIZE),
+        img_size=(args.img_size, args.img_size),
         patch_size=(1, args.patch_xy, args.patch_xy),
         embed_dim=args.embed_dim,
         depth=args.depth,
@@ -237,8 +238,8 @@ def main() -> None:
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    log.info("RegionalFlashJiT3D: %.2fM params (dim=%d, depth=%d, heads=%d, patch=(1,%d,%d), landcover=%d)",
-             n_params, args.embed_dim, args.depth, args.num_heads, args.patch_xy, args.patch_xy, c_landcover)
+    log.info("RegionalFlashJiT3D: %.2fM params (img=%d, dim=%d, depth=%d, heads=%d, patch=(1,%d,%d), landcover=%d)",
+             n_params, args.img_size, args.embed_dim, args.depth, args.num_heads, args.patch_xy, args.patch_xy, c_landcover)
 
     ema_model = copy.deepcopy(model).eval()
     for p_ema in ema_model.parameters():

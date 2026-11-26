@@ -185,8 +185,9 @@ def trainer_step(
     met_err = w_t * (pred_metar - x0_metar) ** 2
     met_m = met_m_tgt.float()
     if metar_count_denom > 0:
+        area_scale = float(H * W) / float(config.PATCH_SIZE * config.PATCH_SIZE)
         n_i = met_m[:, :1].sum(dim=(1, 2, 3))  # (B,) stations per patch
-        count_factor = n_i / float(metar_count_denom)
+        count_factor = n_i / (float(metar_count_denom) * area_scale)
         cnt_ic = met_m.sum(dim=(2, 3)).clamp(min=1.0)  # (B, 6)
         patch_mean_ic = (met_err * met_m).sum(dim=(2, 3)) / cnt_ic
         loss_metar = (patch_mean_ic * count_factor[:, None]).mean()
