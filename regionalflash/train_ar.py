@@ -239,18 +239,18 @@ def _diff_flow_step(
     batch: dict[str, torch.Tensor],
     device: torch.device,
     k_steps: int,
-    diff_ode_steps: int,
+    diff_t_min: float,
     cerra_ch_weights: torch.Tensor | None,
     metar_drop_frac: float,
     noise_rho: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Differentiable Rollout Flow Matching (DRFM):
+    """Differentiable Rollout Flow Matching (DRFM) with random intermediate flow time t_1 ~ U(t_min, 1.0):
       - For k_steps == 1: standard clean 1-step Rectified Flow anchor.
-      - For k_steps >= 2: unrolls K-1 steps with a differentiable `diff_ode_steps`-step
-        Euler ODE (default 2 steps: t=1.0 -> 0.5 -> 0.0, gradient-checkpointed, sharp
-        generative context + on-manifold AR feedback), then computes full Rectified Flow
-        x-prediction loss at random t in (0, 1) on step K WITH gradients flowing back
-        through pred_{K-1} into steps 1..K-1!
+      - For k_steps >= 2: unrolls K-1 steps with a single differentiable forward pass per step
+        starting from noisy target at random t_1 ~ Uniform(diff_t_min, 1.0) (covering the full
+        sharp-to-coarse blur spectrum and sending AR gradients across the whole flow trajectory!),
+        then computes full Rectified Flow x-prediction loss at random t in (0, 1) on step K WITH
+        gradients flowing back through pred_{K-1} into steps 1..K-1!
     """
     grid_seq = batch["grid_seq"].to(device, non_blocking=True)
     metar_seq = batch["metar_seq"].to(device, non_blocking=True)
@@ -271,46 +271,39 @@ def _diff_flow_step(
     met_m0 = cur_mm.bool()
     met_any0 = met_m0.any(dim=1, keepdim=True).float()
 
-    def _diff_euler_step(g_in, m_in, sm_c, sm_t, rm_c, rm_t, gc_base, eps_g, eps_m):
+    def _diff_randt_step(g_in, m_in, sm_c, sm_t, rm_c, rm_t, gc_base, xt_g, xt_m, t_vec):
         f0 = torch.cat([g_in, m_in, sm_c, rm_c, met_any0, static], dim=1)
-        xt_g, xt_m = eps_g, eps_m
-        ts = torch.linspace(1.0, 0.0, diff_ode_steps + 1, device=device)
-        for oi in range(diff_ode_steps):
-            t_cur = ts[oi]
-            t_nxt = ts[oi + 1]
-            t_vec = torch.full((B, 1), float(t_cur.item()), device=device, dtype=gc_base.dtype)
-            gc = torch.cat([gc_base, t_vec], dim=1)
-            f1 = torch.cat([xt_g, xt_m, sm_t, rm_t, met_any0, static], dim=1)
-            x_in = torch.stack([f0, f1], dim=2)
-            x0_g, x0_m = model(x_in, gc, m_in, xt_m, met_any0, static, landcover=landcover)
-
-            # On-manifold sat/radar forcing
-            x0_g = torch.cat([
-                x0_g[:, :C_CERRA],
-                torch.where(sm_t > 0.5, x0_g[:, C_CERRA : C_CERRA + C_SAT], torch.zeros_like(x0_g[:, C_CERRA : C_CERRA + C_SAT])),
-                torch.where(rm_t > 0.5, x0_g[:, C_CERRA + C_SAT :], torch.zeros_like(x0_g[:, C_CERRA + C_SAT :])),
-            ], dim=1)
-
-            if oi == diff_ode_steps - 1:
-                xt_g, xt_m = x0_g, x0_m
-            else:
-                x0_m_step = torch.where(met_any0 > 0.5, x0_m, torch.zeros_like(x0_m))
-                ratio = float(((t_cur - t_nxt) / t_cur.clamp(min=1e-5)).item())
-                xt_g = (1.0 - ratio) * xt_g + ratio * x0_g
-                xt_m = (1.0 - ratio) * xt_m + ratio * x0_m_step
-
-        pg = torch.where(g_rmask, xt_g + g_in, xt_g)
-        pm = torch.where(m_rmask & met_m0, xt_m + m_in, xt_m)
+        f1 = torch.cat([xt_g, xt_m, sm_t, rm_t, met_any0, static], dim=1)
+        x_in = torch.stack([f0, f1], dim=2)
+        gc = torch.cat([gc_base, t_vec], dim=1)
+        x0_g, x0_m = model(x_in, gc, m_in, xt_m, met_any0, static, landcover=landcover)
+        pg = torch.where(g_rmask, x0_g + g_in, x0_g)
+        pm = torch.where(m_rmask & met_m0, x0_m + m_in, x0_m)
         return pg, pm
 
     for s in range(k_steps - 1):
         sm_c, sm_t = sat_m_seq[:, s], sat_m_seq[:, s + 1]
         rm_c, rm_t = rad_m_seq[:, s], rad_m_seq[:, s + 1]
         gc_base = g_cond_seq[:, s]
-        eps_g = torch.randn_like(cur_g)
-        eps_m = torch.randn_like(cur_m)
+
+        # Sample random intermediate flow time t_1 ~ Uniform(diff_t_min, 1.0) per sample
+        t_1 = diff_t_min + (1.0 - diff_t_min) * torch.rand((B, 1), device=device, dtype=gc_base.dtype)
+        t_4d = t_1.view(B, 1, 1, 1)
+
+        # Build noisy state xt at flow time t_1 around the ground-truth next frame (detached target)
+        gt_g_next = grid_seq[:, s + 1]
+        gt_m_next = metar_seq[:, s + 1]
+        x0_g_ref = torch.where(g_rmask, gt_g_next - cur_g.detach(), gt_g_next)
+        both_m = met_m0 & met_m_seq[:, s + 1].bool()
+        x0_m_ref = torch.where(m_rmask & both_m, gt_m_next - cur_m.detach(), gt_m_next)
+        # Keep non-station METAR x0_ref at 0 so xt_m matches the exact t*eps training marginal
+        x0_m_ref = torch.where(met_m_seq[:, s + 1].bool(), x0_m_ref, torch.zeros_like(x0_m_ref))
+
+        xt_g = (1.0 - t_4d) * x0_g_ref + t_4d * torch.randn_like(x0_g_ref)
+        xt_m = (1.0 - t_4d) * x0_m_ref + t_4d * torch.randn_like(x0_m_ref)
+
         pg, pm = checkpoint(
-            _diff_euler_step, cur_g, cur_m, sm_c, sm_t, rm_c, rm_t, gc_base, eps_g, eps_m,
+            _diff_randt_step, cur_g, cur_m, sm_c, sm_t, rm_c, rm_t, gc_base, xt_g, xt_m, t_1,
             use_reentrant=False,
         )
         # Differentiable on-manifold AR feedback
@@ -449,7 +442,7 @@ def main() -> None:
     p.add_argument("--ar-mode", choices=["flow_rollout", "strata_det", "diff_flow"], default="diff_flow")
     p.add_argument("--max-steps", type=int, default=4, help="Max AR steps (4 = 12h rollout)")
     p.add_argument("--rollout-ode-steps", type=int, default=6, help="ODE steps during K-1 rollout in flow_rollout mode")
-    p.add_argument("--diff-ode-steps", type=int, default=2, help="Differentiable Euler ODE steps per rollout step in diff_flow mode")
+    p.add_argument("--diff-t-min", type=float, default=0.2, help="Min intermediate flow time t_1 ~ U(t_min, 1.0) in diff_flow mode")
     p.add_argument("--p-1step", type=float, default=0.25, help="Fraction of batches kept at K=1 anchor in flow_rollout")
     p.add_argument("--huber-delta", type=float, default=1.0, help="Huber delta in strata_det mode")
 
@@ -596,7 +589,7 @@ def main() -> None:
                         batch=batch,
                         device=device,
                         k_steps=k_steps,
-                        diff_ode_steps=args.diff_ode_steps,
+                        diff_t_min=args.diff_t_min,
                         cerra_ch_weights=cerra_ch_weights,
                         metar_drop_frac=args.metar_drop_frac,
                         noise_rho=args.noise_rho,
