@@ -243,11 +243,14 @@ def evaluate_ar(
     t2m_std: float,
     sample_steps: int = 12,
     max_batches: int = 6,
+    ar_mode: str = "flow_rollout",
 ) -> dict[str, float]:
     """Run true multi-step (+3h .. +3*max_steps h) AR rollouts on val and measure physical T2m MAE."""
     model.eval()
     cerra_t2m_idx = config.DYN_CHANNELS.index("t2m")
     metar_t2m_std = float(METAR_STD[0])
+    g_rmask = _build_grid_residual_mask(device)
+    m_rmask = _build_metar_residual_mask(device)
 
     c_err = [0.0] * max_steps
     c_cnt = [0] * max_steps
@@ -269,25 +272,38 @@ def evaluate_ar(
         cur_g = grid_seq[:, 0]
         cur_m = metar_seq[:, 0]
         cur_mm = met_m_seq[:, 0]
+        met_any0 = cur_mm.bool().any(dim=1, keepdim=True).float()
+        zeros_g = torch.zeros_like(cur_g)
+        zeros_m = torch.zeros_like(cur_m)
+        t_one = torch.ones((cur_g.shape[0], 1), device=device, dtype=g_cond_seq.dtype)
 
         for s in range(max_steps):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                pg, pm = sample_next_step(
-                    model,
-                    grid_ctx=cur_g,
-                    metar_ctx=cur_m,
-                    sat_mask_ctx=sat_m_seq[:, s],
-                    sat_mask_tgt=sat_m_seq[:, s + 1],
-                    radar_mask_ctx=rad_m_seq[:, s],
-                    radar_mask_tgt=rad_m_seq[:, s + 1],
-                    metar_mask_ctx=cur_mm,
-                    static=static,
-                    global_cond_base=g_cond_seq[:, s],
-                    n_steps=sample_steps,
-                    use_residual=True,
-                    seed=200 + bi * 10 + s,
-                    landcover=landcover,
-                )
+                if ar_mode == "strata_det":
+                    f0 = torch.cat([cur_g, cur_m, sat_m_seq[:, s], rad_m_seq[:, s], met_any0, static], dim=1)
+                    f1 = torch.cat([zeros_g, zeros_m, sat_m_seq[:, s + 1], rad_m_seq[:, s + 1], met_any0, static], dim=1)
+                    x_in = torch.stack([f0, f1], dim=2)
+                    gc = torch.cat([g_cond_seq[:, s], t_one], dim=1)
+                    x0_g, x0_m = model(x_in, gc, cur_m, zeros_m, met_any0, static, landcover=landcover)
+                    pg = torch.where(g_rmask, x0_g + cur_g, x0_g)
+                    pm = torch.where(m_rmask & cur_mm.bool(), x0_m + cur_m, x0_m)
+                else:
+                    pg, pm = sample_next_step(
+                        model,
+                        grid_ctx=cur_g,
+                        metar_ctx=cur_m,
+                        sat_mask_ctx=sat_m_seq[:, s],
+                        sat_mask_tgt=sat_m_seq[:, s + 1],
+                        radar_mask_ctx=rad_m_seq[:, s],
+                        radar_mask_tgt=rad_m_seq[:, s + 1],
+                        metar_mask_ctx=cur_mm,
+                        static=static,
+                        global_cond_base=g_cond_seq[:, s],
+                        n_steps=sample_steps,
+                        use_residual=True,
+                        seed=200 + bi * 10 + s,
+                        landcover=landcover,
+                    )
             gt_t2m = grid_seq[:, s + 1, cerra_t2m_idx]
             c_err[s] += float((pg[:, cerra_t2m_idx] - gt_t2m).abs().sum().item()) * t2m_std
             c_cnt[s] += gt_t2m.numel()
@@ -403,7 +419,7 @@ def main() -> None:
     best_ar_score = float("inf")
 
     # Baseline 4-step AR evaluation before fine-tuning!
-    base_val = evaluate_ar(ema_model, val_loader, device, args.max_steps, t2m_std)
+    base_val = evaluate_ar(ema_model, val_loader, device, args.max_steps, t2m_std, ar_mode=args.ar_mode)
     log.info(
         "BASELINE (Ep 00) AR VAL | CERRA T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C | "
         "METAR T2m: 3h=%.2f°C 6h=%.2f°C 9h=%.2f°C 12h=%.2f°C",
@@ -418,9 +434,12 @@ def main() -> None:
         t0_ep = time.time()
         running: dict[str, float] = {}
 
-        # STRATA-style curriculum: ramp max rollout horizon 2 -> 3 -> 4 across first 40% of epochs
-        cur_max_k = min(args.max_steps, 2 + int(epoch * (args.max_steps - 1) / max(int(0.4 * args.epochs), 1)))
-        log.info("Starting AR Ep %02d/%02d (curriculum max_k=%d, mode=%s)", epoch + 1, args.epochs, cur_max_k, args.ar_mode)
+        # STRATA Appendix E schedule: Stage 1 (N=2) for first ~47% of epochs, Stage 2 (N=4) for remainder
+        if args.ar_mode == "strata_det":
+            cur_max_k = 2 if epoch < max(1, int(round(0.47 * args.epochs))) else args.max_steps
+        else:
+            cur_max_k = min(args.max_steps, 2 + int(epoch * (args.max_steps - 1) / max(int(0.4 * args.epochs), 1)))
+        log.info("Starting AR Ep %02d/%02d (curriculum k=%d, mode=%s)", epoch + 1, args.epochs, cur_max_k, args.ar_mode)
 
         for step_i, batch in enumerate(train_loader, 1):
             if global_step < args.warmup_steps:
@@ -432,7 +451,9 @@ def main() -> None:
                 pg["lr"] = lr
 
             # Sample horizon K for this batch
-            if args.ar_mode == "flow_rollout" and torch.rand(1).item() < args.p_1step:
+            if args.ar_mode == "strata_det":
+                k_steps = cur_max_k
+            elif torch.rand(1).item() < args.p_1step:
                 k_steps = 1
             else:
                 k_steps = int(torch.randint(2, cur_max_k + 1, (1,)).item())
@@ -479,7 +500,7 @@ def main() -> None:
                     avg["loss"], avg["loss_cerra"], avg["loss_sat"], avg["loss_radar"], avg["loss_metar"],
                 )
 
-        val_ar = evaluate_ar(ema_model, val_loader, device, args.max_steps, t2m_std)
+        val_ar = evaluate_ar(ema_model, val_loader, device, args.max_steps, t2m_std, ar_mode=args.ar_mode)
         lead_max = 3 * args.max_steps
         ar_score = val_ar[f"cerra_t2m_{lead_max}h"] + 0.5 * val_ar[f"metar_t2m_{lead_max}h"]
         log.info(
