@@ -173,6 +173,7 @@ def main() -> None:
     # Training recipe
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation micro-steps per optimizer step")
     p.add_argument("--train-samples-per-epoch", type=int, default=16384)
     p.add_argument("--val-samples", type=int, default=1024)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -279,25 +280,26 @@ def main() -> None:
     cerra_ch_weights = build_cerra_channel_weights(args.data_dir, device)
     t2m_std = float(train_ds.cerra_std[config.DYN_CHANNELS.index("t2m"), 0, 0])
 
-    total_steps = args.epochs * len(train_loader)
+    grad_accum = max(1, int(args.grad_accum))
+    n_batches = len(train_loader)
+    opt_steps_per_epoch = math.ceil(n_batches / grad_accum)
+    total_steps = args.epochs * opt_steps_per_epoch
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(start_epoch, args.epochs):
         train_model.train()
         t0_ep = time.time()
         running: dict[str, float] = {}
+        opt.zero_grad(set_to_none=True)
 
         for step_i, batch in enumerate(train_loader, 1):
-            # Cosine LR schedule with linear warmup
+            # Cosine LR schedule with linear warmup (stepped per optimizer update)
             if global_step < args.warmup_steps:
                 lr = args.lr * (global_step + 1) / max(args.warmup_steps, 1)
             else:
                 prog = (global_step - args.warmup_steps) / max(total_steps - args.warmup_steps, 1)
                 lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + math.cos(math.pi * min(prog, 1.0)))
-            for pg in opt.param_groups:
-                pg["lr"] = lr
 
-            opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
                 loss, metrics = trainer_step(
                     train_model,
@@ -309,20 +311,26 @@ def main() -> None:
                     noise_rho=args.noise_rho,
                 )
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            update_ema(ema_model, model, args.ema_decay)
-            global_step += 1
+            window_size = grad_accum if (step_i <= (n_batches // grad_accum) * grad_accum) else (n_batches % grad_accum)
+            (loss / window_size).backward()
+
+            if step_i % grad_accum == 0 or step_i == n_batches:
+                for pg in opt.param_groups:
+                    pg["lr"] = lr
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                update_ema(ema_model, model, args.ema_decay)
+                global_step += 1
 
             for k, v in metrics.items():
                 running[k] = running.get(k, 0.0) + v
 
-            if step_i in (1, 10) or step_i % 50 == 0 or step_i == len(train_loader):
+            if step_i in (1, 10) or step_i % 50 == 0 or step_i == n_batches:
                 avg = {k: v / step_i for k, v in running.items()}
                 log.info(
                     "Ep %02d [%d/%d] lr=%.2e | loss=%.4f (cerra=%.4f sat=%.4f rad=%.4f metar=%.4f)",
-                    epoch + 1, step_i, len(train_loader), lr,
+                    epoch + 1, step_i, n_batches, lr,
                     avg["loss"], avg["loss_cerra"], avg["loss_sat"], avg["loss_radar"], avg["loss_metar"],
                 )
 
