@@ -11,8 +11,10 @@ Compares predicted vs observed across +3h .. +24h:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
+import time
 
 import matplotlib
 matplotlib.use("Agg")
@@ -165,10 +167,14 @@ def main() -> None:
     p.add_argument("--lead-steps", type=int, default=8, help="Number of 3h autoregressive steps (8 = 24h)")
     p.add_argument("--n-members", type=int, default=1, help="Ensemble members")
     p.add_argument("--ode-steps", type=int, default=20)
+    p.add_argument("--solver", choices=["euler", "heun"], default="euler", help="ODE solver (euler or 2nd-order heun)")
+    p.add_argument("--t-power", type=float, default=1.0, help="Time schedule power (>1 concentrates steps near t=0)")
     p.add_argument("--domain-size", type=int, default=1069, help="Domain size (1069 = full Europe!)")
     p.add_argument("--stride", type=int, default=0, help="Tile stride (0 = auto 3/4 of model img_size)")
     p.add_argument("--tile-batch-size", type=int, default=16)
     p.add_argument("--deterministic", action="store_true", help="1-step STRATA deterministic mode (t=1.0, xt=0)")
+    p.add_argument("--no-plot", action="store_true", help="Skip saving matplotlib figures")
+    p.add_argument("--tag", type=str, default="", help="Optional filename suffix tag for outputs")
     p.add_argument("--split", default="val", choices=["val", "test"])
     args = p.parse_args()
 
@@ -243,6 +249,7 @@ def main() -> None:
     ens_grids = np.zeros((args.n_members, args.lead_steps, 69, S, S), dtype=np.float32)
     ens_metars = np.zeros((args.n_members, args.lead_steps, 6, S, S), dtype=np.float32)
 
+    t0_rollout = time.perf_counter()
     for mem in range(args.n_members):
         cur_g = torch.from_numpy(gt_grids[0]).to(device)
         cur_m = torch.from_numpy(gt_metars[0]).to(device)
@@ -280,6 +287,8 @@ def main() -> None:
                     sat_mask_tgt_full=sm_next,
                     radar_mask_tgt_full=rm_next,
                     deterministic=args.deterministic,
+                    solver=args.solver,
+                    t_power=args.t_power,
                 )
             pred_g_f = pred_g.float()
             pred_m_f = pred_m.float()
@@ -291,31 +300,75 @@ def main() -> None:
             cur_g, cur_m = project_ar_feedback(pred_g_f, pred_m_f, sm_next, rm_next, cur_mm)
             log.info("  member %d/%d | step %d/%d (+%02dh) done", mem + 1, args.n_members, step + 1, args.lead_steps, 3 * (step + 1))
 
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    rollout_sec = time.perf_counter() - t0_rollout
+    nfe_per_step = 1 if args.deterministic else (args.ode_steps if args.solver == "euler" else 2 * args.ode_steps - 1)
+
     t2m_i = config.DYN_CHANNELS.index("t2m")
+    z500_i = config.DYN_CHANNELS.index("z_500")
+    msl_i = config.DYN_CHANNELS.index("msl_anom_hpa")
+    u10_i = config.DYN_CHANNELS.index("u10")
+    v10_i = config.DYN_CHANNELS.index("v10")
     t2m_mean, t2m_std = float(ds.cerra_mean[t2m_i, 0, 0]), float(ds.cerra_std[t2m_i, 0, 0])
+    z500_mean, z500_std = float(ds.cerra_mean[z500_i, 0, 0]), float(ds.cerra_std[z500_i, 0, 0])
+    msl_mean, msl_std = float(ds.cerra_mean[msl_i, 0, 0]), float(ds.cerra_std[msl_i, 0, 0])
+    u10_mean, u10_std = float(ds.cerra_mean[u10_i, 0, 0]), float(ds.cerra_std[u10_i, 0, 0])
+    v10_mean, v10_std = float(ds.cerra_mean[v10_i, 0, 0]), float(ds.cerra_std[v10_i, 0, 0])
     ir11_i = 57 + 8
+    ir11_mean, ir11_std = float(SAT_MEAN[8]), float(SAT_STD[8])
     rad_i = 68
     met_t2m_std = float(METAR_STD[0])
 
     mean_grids = ens_grids.mean(axis=0)
     mean_metars = ens_metars.mean(axis=0)
 
-    log.info("=== 24h Full-Coverage Verification (Domain %dx%d & Cévennes Box) ===", S, S)
+    log.info(
+        "=== %dh Verification (Domain %dx%d | solver=%s steps=%d nfe=%d t_power=%.2f | %.1fs) ===",
+        3 * args.lead_steps, S, S, args.solver, args.ode_steps, nfe_per_step, args.t_power, rollout_sec,
+    )
+    records = []
     for step in range(args.lead_steps):
         lead_h = 3 * (step + 1)
         gt_g = gt_grids[step + 1]
         rm = gt_r_masks[step + 1][0] > 0.5
+        sm = gt_s_masks[step + 1][0] > 0.5
 
         gt_t2m = gt_g[t2m_i] * t2m_std + t2m_mean
         pr_t2m = mean_grids[step, t2m_i] * t2m_std + t2m_mean
+        t2m_mae = float(np.abs(pr_t2m - gt_t2m).mean())
+        t2m_rmse = float(np.sqrt(np.mean((pr_t2m - gt_t2m) ** 2)))
+        t2m_bias = float((pr_t2m - gt_t2m).mean())
+
+        gt_z500 = gt_g[z500_i] * z500_std + z500_mean
+        pr_z500 = mean_grids[step, z500_i] * z500_std + z500_mean
+        z500_mae = float(np.abs(pr_z500 - gt_z500).mean())
+        z500_rmse = float(np.sqrt(np.mean((pr_z500 - gt_z500) ** 2)))
+
+        gt_msl = gt_g[msl_i] * msl_std + msl_mean
+        pr_msl = mean_grids[step, msl_i] * msl_std + msl_mean
+        msl_mae = float(np.abs(pr_msl - gt_msl).mean())
+
+        gt_u10 = gt_g[u10_i] * u10_std + u10_mean
+        pr_u10 = mean_grids[step, u10_i] * u10_std + u10_mean
+        gt_v10 = gt_g[v10_i] * v10_std + v10_mean
+        pr_v10 = mean_grids[step, v10_i] * v10_std + v10_mean
+        wind10_mae = float(np.sqrt((pr_u10 - gt_u10) ** 2 + (pr_v10 - gt_v10) ** 2).mean())
+
+        gt_ir = gt_g[ir11_i] * ir11_std + ir11_mean
+        pr_ir = mean_grids[step, ir11_i] * ir11_std + ir11_mean
+        ir11_mae = float(np.abs(pr_ir[sm] - gt_ir[sm]).mean()) if sm.any() else float("nan")
+
+        # Mean normalized CERRA MSE across all 57 channels (overall synoptic/state error)
+        cerra_all_rmse = float(np.sqrt(np.mean((mean_grids[step, :57] - gt_g[:57]) ** 2)))
 
         gt_dbz = gt_g[rad_i] * RADAR_SCALE
         pr_dbz = ens_grids[0, step, rad_i] * RADAR_SCALE
 
-        t2m_mae = float(np.abs(pr_t2m - gt_t2m).mean())
         cev_valid = cev_mask & rm
         csi20 = _csi(pr_dbz[cev_valid], gt_dbz[cev_valid], 20.0)
         csi35 = _csi(pr_dbz[cev_valid], gt_dbz[cev_valid], 35.0)
+        eu_csi20 = _csi(pr_dbz[rm], gt_dbz[rm], 20.0)
         gt_max_cev = float(gt_dbz[cev_valid].max())
         pr_max_cev = float(pr_dbz[cev_valid].max())
 
@@ -326,32 +379,72 @@ def main() -> None:
         )
         t_str = str(ts_df.loc[args.start_idx + step + 1, "timestamp_utc"])[:16]
         log.info(
-            "+%02dh (%s) | Pan-EU T2m MAE=%.2f°C | Pan-EU METAR MAE=%.2f°C | "
-            "Cévennes Radar: max(gt=%.1f, pred=%.1f) dBZ | CSI20=%.2f CSI35=%.2f",
-            lead_h, t_str, t2m_mae, met_mae, gt_max_cev, pr_max_cev, csi20, csi35,
+            "+%02dh (%s) | CERRA57=%.3f T2m=%.2f°C(b=%+.2f) Z500=%.2fdam MSL=%.2fhPa W10=%.2fm/s | "
+            "IR11=%.2f°C METAR=%.2f°C | EU_CSI20=%.2f | Cév: max(gt=%.1f,pr=%.1f) CSI20=%.2f CSI35=%.2f",
+            lead_h, t_str, cerra_all_rmse, t2m_mae, t2m_bias, z500_mae, msl_mae, wind10_mae,
+            ir11_mae, met_mae, eu_csi20, gt_max_cev, pr_max_cev, csi20, csi35,
         )
+        records.append({
+            "lead_h": lead_h,
+            "timestamp": t_str,
+            "cerra57_rmse_norm": cerra_all_rmse,
+            "t2m_mae": t2m_mae,
+            "t2m_rmse": t2m_rmse,
+            "t2m_bias": t2m_bias,
+            "z500_mae": z500_mae,
+            "z500_rmse": z500_rmse,
+            "msl_mae": msl_mae,
+            "wind10_mae": wind10_mae,
+            "ir11_mae": ir11_mae,
+            "metar_t2m_mae": met_mae,
+            "eu_csi20": eu_csi20,
+            "cev_csi20": csi20,
+            "cev_csi35": csi35,
+            "cev_gt_max_dbz": gt_max_cev,
+            "cev_pr_max_dbz": pr_max_cev,
+        })
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    show_steps = [s for s in [0, 1, 3, 5, 7] if s < args.lead_steps]
+    suffix = f"_{args.tag}" if args.tag else f"_{args.solver}_s{args.ode_steps}_p{args.t_power:g}"
+    summary = {
+        "ckpt": str(args.ckpt),
+        "start_idx": args.start_idx,
+        "t0_utc": t0_str,
+        "domain_size": S,
+        "tile_size": tile_size,
+        "stride": stride,
+        "solver": args.solver,
+        "ode_steps": args.ode_steps,
+        "nfe_per_step": nfe_per_step,
+        "t_power": args.t_power,
+        "n_members": args.n_members,
+        "rollout_sec": rollout_sec,
+        "steps": records,
+    }
+    (args.out_dir / f"metrics{suffix}.json").write_text(json.dumps(summary, indent=2))
+    log.info("Saved metrics -> %s", args.out_dir / f"metrics{suffix}.json")
 
-    # 1. Full-domain pan-European view
-    _plot_grid(
-        args.out_dir / f"cevenol_full_{S}_t{args.start_idx}.png",
-        f"RegionalFlash 171M — Full Pan-European {S}x{S} Multi-Diffusion Rollout (init {t0_str[:16]} UTC)",
-        gt_grids, ens_grids[0], gt_s_masks, lsm_sub, orog_sub, ts_df, args.start_idx, show_steps,
-        slice(0, S), slice(0, S), rad_i, ir11_i,
-    )
+    if not args.no_plot:
+        show_steps = [s for s in [0, 1, 3, 5, 7] if s < args.lead_steps]
 
-    # 2. Zoomed Cévennes / France view from the exact same full-Europe rollout
-    if S >= 512:
-        zy0, zy1 = max(0, (cy - y0) - 128), min(S, (cy - y0) + 128)
-        zx0, zx1 = max(0, (cx - x0) - 128), min(S, (cx - x0) + 128)
+        # 1. Full-domain pan-European view
         _plot_grid(
-            args.out_dir / f"cevenol_full_{S}_zoom_t{args.start_idx}.png",
-            f"RegionalFlash 171M — Cévennes Zoom from Full {S}x{S} Europe Rollout (init {t0_str[:16]} UTC)",
+            args.out_dir / f"cevenol_full_{S}_t{args.start_idx}{suffix}.png",
+            f"RegionalFlash ({args.solver} s={args.ode_steps} p={args.t_power:g}) — Pan-EU {S}x{S} (init {t0_str[:16]} UTC)",
             gt_grids, ens_grids[0], gt_s_masks, lsm_sub, orog_sub, ts_df, args.start_idx, show_steps,
-            slice(zy0, zy1), slice(zx0, zx1), rad_i, ir11_i,
+            slice(0, S), slice(0, S), rad_i, ir11_i,
         )
+
+        # 2. Zoomed Cévennes / France view from the exact same full-Europe rollout
+        if S >= 512:
+            zy0, zy1 = max(0, (cy - y0) - 128), min(S, (cy - y0) + 128)
+            zx0, zx1 = max(0, (cx - x0) - 128), min(S, (cx - x0) + 128)
+            _plot_grid(
+                args.out_dir / f"cevenol_full_{S}_zoom_t{args.start_idx}{suffix}.png",
+                f"RegionalFlash ({args.solver} s={args.ode_steps} p={args.t_power:g}) — Cévennes Zoom (init {t0_str[:16]} UTC)",
+                gt_grids, ens_grids[0], gt_s_masks, lsm_sub, orog_sub, ts_df, args.start_idx, show_steps,
+                slice(zy0, zy1), slice(zx0, zx1), rad_i, ir11_i,
+            )
 
 
 if __name__ == "__main__":

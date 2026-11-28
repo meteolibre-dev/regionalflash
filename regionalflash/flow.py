@@ -211,6 +211,14 @@ def trainer_step(
     return total_loss, metrics
 
 
+def _make_time_schedule(n_steps: int, t_power: float, device: torch.device) -> torch.Tensor:
+    """Monotonic flow-time grid from 1.0 -> 0.0. `t_power > 1` concentrates steps near t=0."""
+    ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device, dtype=torch.float32) ** float(t_power)
+    ts[0] = 1.0
+    ts[-1] = 0.0
+    return ts
+
+
 @torch.no_grad()
 def sample_next_step(
     model: torch.nn.Module,
@@ -228,56 +236,83 @@ def sample_next_step(
     noise_rho: float = 0.0,
     seed: int | None = None,
     landcover: torch.Tensor | None = None,
+    solver: str = "euler",
+    t_power: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Euler rectified-flow x-prediction ODE sampler from t=1 -> 0 for one 128x128 patch.
+    """Euler or 2nd-order Heun rectified-flow x-prediction ODE sampler from t=1 -> 0 for a batch.
 
     Velocity from x-prediction: `v(x_t, t) = (x_t - x0_pred) / max(t, eps)`.
-    Step update: `x_{t - dt} = x_t - dt * v = (1 - dt/t) * x_t + (dt/t) * x0_pred`.
+    - Euler: `x_{t'} = x_t - dt * v(x_t, t) = (1 - dt/t) * x_t + (dt/t) * x0_pred` (N NFEs).
+    - Heun:  2nd-order predictor-corrector using `0.5 * (v1 + v2)` for all steps with `t' > 0`,
+             falling back to exact endpoint `x0_pred` on the final step to `t = 0` (2N - 1 NFEs).
     """
+    if solver not in ("euler", "heun"):
+        raise ValueError(f"Unsupported ODE solver '{solver}'. Expected 'euler' or 'heun'.")
+
     device = grid_ctx.device
     B, _, H, W = grid_ctx.shape
     gen = torch.Generator(device=device)
     if seed is not None:
         gen.manual_seed(seed)
 
-    xt_grid = structured_gaussian_noise((B, C_GRID, H, W), device, grid_ctx.dtype, rho=noise_rho, generator=gen)
-    xt_metar = torch.randn((B, C_METAR, H, W), device=device, dtype=metar_ctx.dtype, generator=gen)
+    xt_grid = structured_gaussian_noise((B, C_GRID, H, W), device, torch.float32, rho=noise_rho, generator=gen)
+    xt_metar = torch.randn((B, C_METAR, H, W), device=device, dtype=torch.float32, generator=gen)
     met_any_ctx = metar_mask_ctx.any(dim=1, keepdim=True).float()
     frame0 = torch.cat([grid_ctx, metar_ctx, sat_mask_ctx, radar_mask_ctx, met_any_ctx, static], dim=1)
 
-    ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device)
-    for i in range(n_steps):
-        t_cur = ts[i]
-        t_nxt = ts[i + 1]
-        t_vec = torch.full((B, 1), float(t_cur.item()), device=device, dtype=global_cond_base.dtype)
+    def _eval_x0(xt_g: torch.Tensor, xt_m: torch.Tensor, t_val: torch.Tensor, release_metar: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        t_vec = torch.full((B, 1), float(t_val.item()), device=device, dtype=global_cond_base.dtype)
         global_cond = torch.cat([global_cond_base, t_vec], dim=1)
-
-        frame1 = torch.cat([xt_grid, xt_metar, sat_mask_tgt, radar_mask_tgt, met_any_ctx, static], dim=1)
+        frame1 = torch.cat(
+            [xt_g.to(grid_ctx.dtype), xt_m.to(metar_ctx.dtype), sat_mask_tgt, radar_mask_tgt, met_any_ctx, static],
+            dim=1,
+        )
         x_in = torch.stack([frame0, frame1], dim=2)
-
-        x0_g, x0_m = model(x_in, global_cond, metar_ctx, xt_metar, met_any_ctx, static, landcover=landcover)
+        x0_g, x0_m = model(x_in, global_cond, metar_ctx, xt_m.to(metar_ctx.dtype), met_any_ctx, static, landcover=landcover)
+        x0_g = x0_g.float().clone()
+        x0_m = x0_m.float()
 
         # On-manifold forcing (FlashEdges): zero x0 at off-coverage SatWeave & OPERA Radar
         # pixels so x_t follows exact t*noise -> 0 decay there.
-        x0_g = x0_g.clone()
         x0_g[:, C_CERRA : C_CERRA + C_SAT] = torch.where(
             sat_mask_tgt > 0.5, x0_g[:, C_CERRA : C_CERRA + C_SAT], torch.zeros_like(x0_g[:, C_CERRA : C_CERRA + C_SAT])
         )
         x0_g[:, C_CERRA + C_SAT :] = torch.where(
             radar_mask_tgt > 0.5, x0_g[:, C_CERRA + C_SAT :], torch.zeros_like(x0_g[:, C_CERRA + C_SAT :])
         )
+        if not release_metar:
+            x0_m = torch.where(met_any_ctx > 0.5, x0_m, torch.zeros_like(x0_m))
+        return x0_g, x0_m
 
-        if i == n_steps - 1:
-            # Hybrid METAR forcing released on final step to keep dense spatial-fill forecast
-            xt_grid, xt_metar = x0_g, x0_m
-        else:
-            # Hybrid METAR forcing: zero non-station x0_m on intermediate steps so xt_metar
-            # stays on the exact t*noise -> 0 training marginal and never contaminates the trunk.
-            x0_m_step = torch.where(met_any_ctx > 0.5, x0_m, torch.zeros_like(x0_m))
+    ts = _make_time_schedule(n_steps, t_power, device)
+    for i in range(n_steps):
+        t_cur = ts[i]
+        t_nxt = ts[i + 1]
+        is_last = (i == n_steps - 1)
+        x0_g1, x0_m1 = _eval_x0(xt_grid, xt_metar, t_cur, release_metar=is_last)
+
+        if is_last:
+            xt_grid, xt_metar = x0_g1, x0_m1
+        elif solver == "euler":
             ratio = float(((t_cur - t_nxt) / t_cur.clamp(min=1e-5)).item())
-            xt_grid = (1.0 - ratio) * xt_grid + ratio * x0_g
-            xt_metar = (1.0 - ratio) * xt_metar + ratio * x0_m_step
+            xt_grid = (1.0 - ratio) * xt_grid + ratio * x0_g1
+            xt_metar = (1.0 - ratio) * xt_metar + ratio * x0_m1
+        else:
+            dt = float((t_cur - t_nxt).item())
+            t_cur_f = float(t_cur.clamp(min=1e-5).item())
+            t_nxt_f = float(t_nxt.clamp(min=1e-5).item())
+            v_g1 = (xt_grid - x0_g1) / t_cur_f
+            v_m1 = (xt_metar - x0_m1) / t_cur_f
+            xt_g_pred = xt_grid - dt * v_g1
+            xt_m_pred = xt_metar - dt * v_m1
+            x0_g2, x0_m2 = _eval_x0(xt_g_pred, xt_m_pred, t_nxt, release_metar=False)
+            v_g2 = (xt_g_pred - x0_g2) / t_nxt_f
+            v_m2 = (xt_m_pred - x0_m2) / t_nxt_f
+            xt_grid = xt_grid - 0.5 * dt * (v_g1 + v_g2)
+            xt_metar = xt_metar - 0.5 * dt * (v_m1 + v_m2)
 
+    xt_grid = xt_grid.to(grid_ctx.dtype)
+    xt_metar = xt_metar.to(metar_ctx.dtype)
     if use_residual:
         g_rmask = _build_grid_residual_mask(device)
         m_rmask = _build_metar_residual_mask(device)
@@ -314,13 +349,20 @@ def sample_tiled_europe(
     sat_mask_tgt_full: torch.Tensor | None = None,
     radar_mask_tgt_full: torch.Tensor | None = None,
     deterministic: bool = False,
+    solver: str = "euler",
+    t_power: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Multi-Diffusion / Tiled Diffusion over the full 1069x1069 European grid.
 
-    At EVERY denoising step `t_k`, overlapping `128x128` tiles (`stride=96`, 32px overlap)
-    are denoised in parallel and blended back onto the global canvas with a 2D raised-cosine
-    weight window so adjacent tiles communicate seamlessly across the entire continent.
+    At EVERY denoising step `t_k`, overlapping tiles are denoised in parallel and blended
+    back onto the global canvas with a 2D raised-cosine weight window so adjacent tiles
+    communicate seamlessly across the entire continent.
+    Supports `solver="euler"` (N NFEs) and `solver="heun"` (2nd-order predictor-corrector, 2N - 1 NFEs),
+    plus `t_power` (`> 1.0` concentrates steps near small `t`).
     """
+    if solver not in ("euler", "heun"):
+        raise ValueError(f"Unsupported ODE solver '{solver}'. Expected 'euler' or 'heun'.")
+
     device = grid_ctx_full.device
     _, H_full, W_full = grid_ctx_full.shape
     sm_tgt_full = sat_mask_tgt_full if sat_mask_tgt_full is not None else sat_mask_full
@@ -334,35 +376,50 @@ def sample_tiled_europe(
         xs.append(W_full - patch_size)
     tiles = [(y0, x0) for y0 in ys for x0 in xs]
 
+    # Precompute static per-tile global conditioning base (solar + lat/lon + time) once across all ODE steps
+    tile_gc_base: list[torch.Tensor] = []
+    for y0, x0 in tiles:
+        cy, cx = y0 + patch_size // 2, x0 + patch_size // 2
+        c_lat = float(lat_full[cy, cx].item())
+        c_lon = float(lon_full[cy, cx].item())
+        lat_n = torch.tensor([(c_lat - 48.0) / 15.0], device=device, dtype=time_feats.dtype)
+        lon_n = torch.tensor([(c_lon - 10.0) / 25.0], device=device, dtype=time_feats.dtype)
+        sol_t = torch.from_numpy(
+            solar_step_features(ctx_unix_s, tgt_unix_s, noon_unix_s, c_lon, c_lat)
+        ).to(device=device, dtype=time_feats.dtype)
+        tile_gc_base.append(torch.cat([time_feats, lat_n, lon_n, sol_t], dim=0))
+
     # 2D raised-cosine blending window (strictly positive everywhere)
-    w1d = 0.5 * (1.0 - torch.cos(2.0 * math.pi * (torch.arange(patch_size, device=device) + 0.5) / patch_size))
+    w1d = 0.5 * (1.0 - torch.cos(2.0 * math.pi * (torch.arange(patch_size, device=device, dtype=torch.float32) + 0.5) / patch_size))
     win = (w1d[:, None] * w1d[None, :]).clamp(min=1e-3)  # (P, P)
 
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     if deterministic:
-        xt_grid_full = torch.zeros((C_GRID, H_full, W_full), device=device, dtype=grid_ctx_full.dtype)
-        xt_metar_full = torch.zeros((C_METAR, H_full, W_full), device=device, dtype=metar_ctx_full.dtype)
+        xt_grid_full = torch.zeros((C_GRID, H_full, W_full), device=device, dtype=torch.float32)
+        xt_metar_full = torch.zeros((C_METAR, H_full, W_full), device=device, dtype=torch.float32)
         n_steps = 1
+        solver = "euler"
     else:
-        xt_grid_full = torch.randn((C_GRID, H_full, W_full), device=device, dtype=grid_ctx_full.dtype, generator=gen)
-        xt_metar_full = torch.randn((C_METAR, H_full, W_full), device=device, dtype=metar_ctx_full.dtype, generator=gen)
+        xt_grid_full = torch.randn((C_GRID, H_full, W_full), device=device, dtype=torch.float32, generator=gen)
+        xt_metar_full = torch.randn((C_METAR, H_full, W_full), device=device, dtype=torch.float32, generator=gen)
     met_any_full = metar_mask_full.any(dim=0, keepdim=True).float()
 
-    ts = torch.linspace(1.0, 0.0, n_steps + 1, device=device)
-    for step_i in range(n_steps):
-        t_cur = ts[step_i]
-        t_nxt = ts[step_i + 1]
-        ratio = 1.0 if step_i == n_steps - 1 else float(((t_cur - t_nxt) / t_cur.clamp(min=1e-5)).item())
-
-        acc_grid = torch.zeros_like(xt_grid_full)
-        acc_metar = torch.zeros_like(xt_metar_full)
-        acc_w = torch.zeros((1, H_full, W_full), device=device, dtype=xt_grid_full.dtype)
+    def _eval_tiled_x0(
+        xt_g_in: torch.Tensor,
+        xt_m_in: torch.Tensor,
+        t_val: torch.Tensor,
+        release_metar: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        acc_grid = torch.zeros((C_GRID, H_full, W_full), device=device, dtype=torch.float32)
+        acc_metar = torch.zeros((C_METAR, H_full, W_full), device=device, dtype=torch.float32)
+        acc_w = torch.zeros((1, H_full, W_full), device=device, dtype=torch.float32)
+        t_1d = t_val.to(dtype=time_feats.dtype).view(1)
 
         for bi in range(0, len(tiles), tile_batch_size):
             batch_tiles = tiles[bi : bi + tile_batch_size]
             f0_list, f1_list, cm_list, nm_list, cmm_list, st_list, gc_list, lc_list = [], [], [], [], [], [], [], []
-            for y0, x0 in batch_tiles:
+            for ti_local, (y0, x0) in enumerate(batch_tiles):
                 y1, x1 = y0 + patch_size, x0 + patch_size
                 g0 = grid_ctx_full[:, y0:y1, x0:x1]
                 m0 = metar_ctx_full[:, y0:y1, x0:x1]
@@ -372,8 +429,8 @@ def sample_tiled_europe(
                 rm1 = rm_tgt_full[:, y0:y1, x0:x1]
                 ma = met_any_full[:, y0:y1, x0:x1]
                 st = static_full[:, y0:y1, x0:x1]
-                gn = xt_grid_full[:, y0:y1, x0:x1]
-                mn = xt_metar_full[:, y0:y1, x0:x1]
+                gn = xt_g_in[:, y0:y1, x0:x1].to(grid_ctx_full.dtype)
+                mn = xt_m_in[:, y0:y1, x0:x1].to(metar_ctx_full.dtype)
 
                 f0_list.append(torch.cat([g0, m0, sm0, rm0, ma, st], dim=0))
                 f1_list.append(torch.cat([gn, mn, sm1, rm1, ma, st], dim=0))
@@ -383,16 +440,7 @@ def sample_tiled_europe(
                 st_list.append(st)
                 if landcover_full is not None:
                     lc_list.append(landcover_full[:, y0:y1, x0:x1])
-
-                cy, cx = y0 + patch_size // 2, x0 + patch_size // 2
-                c_lat = float(lat_full[cy, cx].item())
-                c_lon = float(lon_full[cy, cx].item())
-                lat_n = torch.tensor([(c_lat - 48.0) / 15.0], device=device, dtype=time_feats.dtype)
-                lon_n = torch.tensor([(c_lon - 10.0) / 25.0], device=device, dtype=time_feats.dtype)
-                sol_t = torch.from_numpy(
-                    solar_step_features(ctx_unix_s, tgt_unix_s, noon_unix_s, c_lon, c_lat)
-                ).to(device=device, dtype=time_feats.dtype)
-                gc_list.append(torch.cat([time_feats, lat_n, lon_n, sol_t, t_cur.view(1)], dim=0))
+                gc_list.append(torch.cat([tile_gc_base[bi + ti_local], t_1d], dim=0))
 
             x_in = torch.stack([torch.stack(f0_list, dim=0), torch.stack(f1_list, dim=0)], dim=2)
             x0_g, x0_m = model(
@@ -404,11 +452,13 @@ def sample_tiled_europe(
                 torch.stack(st_list, dim=0),
                 landcover=(torch.stack(lc_list, dim=0) if lc_list else None),
             )
+            x0_g_f = x0_g.float()
+            x0_m_f = x0_m.float()
 
             for ti, (y0, x0) in enumerate(batch_tiles):
                 y1, x1 = y0 + patch_size, x0 + patch_size
-                acc_grid[:, y0:y1, x0:x1] += x0_g[ti] * win
-                acc_metar[:, y0:y1, x0:x1] += x0_m[ti] * win
+                acc_grid[:, y0:y1, x0:x1] += x0_g_f[ti] * win
+                acc_metar[:, y0:y1, x0:x1] += x0_m_f[ti] * win
                 acc_w[:, y0:y1, x0:x1] += win
 
         x0_grid_full = torch.nan_to_num(acc_grid / acc_w, nan=0.0, posinf=8.0, neginf=-8.0)
@@ -427,14 +477,41 @@ def sample_tiled_europe(
         )
 
         # Hybrid METAR forcing: zero non-station x0_metar on every step EXCEPT the last
-        if step_i < n_steps - 1:
-            x0_metar_step = torch.where(met_any_full > 0.5, x0_metar_full, torch.zeros_like(x0_metar_full))
+        if not release_metar:
+            x0_metar_full = torch.where(met_any_full > 0.5, x0_metar_full, torch.zeros_like(x0_metar_full))
+        return x0_grid_full, x0_metar_full
+
+    ts = _make_time_schedule(n_steps, t_power, device)
+    for step_i in range(n_steps):
+        t_cur = ts[step_i]
+        t_nxt = ts[step_i + 1]
+        is_last = (step_i == n_steps - 1)
+
+        x0_g1, x0_m1 = _eval_tiled_x0(xt_grid_full, xt_metar_full, t_cur, release_metar=is_last)
+
+        if is_last:
+            xt_grid_full, xt_metar_full = x0_g1, x0_m1
+        elif solver == "euler":
+            ratio = float(((t_cur - t_nxt) / t_cur.clamp(min=1e-5)).item())
+            xt_grid_full = (1.0 - ratio) * xt_grid_full + ratio * x0_g1
+            xt_metar_full = (1.0 - ratio) * xt_metar_full + ratio * x0_m1
         else:
-            x0_metar_step = x0_metar_full
+            dt = float((t_cur - t_nxt).item())
+            t_cur_f = float(t_cur.clamp(min=1e-5).item())
+            t_nxt_f = float(t_nxt.clamp(min=1e-5).item())
+            v_g1 = (xt_grid_full - x0_g1) / t_cur_f
+            v_m1 = (xt_metar_full - x0_m1) / t_cur_f
+            xt_g_pred = xt_grid_full - dt * v_g1
+            xt_m_pred = xt_metar_full - dt * v_m1
 
-        xt_grid_full = (1.0 - ratio) * xt_grid_full + ratio * x0_grid_full
-        xt_metar_full = (1.0 - ratio) * xt_metar_full + ratio * x0_metar_step
+            x0_g2, x0_m2 = _eval_tiled_x0(xt_g_pred, xt_m_pred, t_nxt, release_metar=False)
+            v_g2 = (xt_g_pred - x0_g2) / t_nxt_f
+            v_m2 = (xt_m_pred - x0_m2) / t_nxt_f
+            xt_grid_full = xt_grid_full - 0.5 * dt * (v_g1 + v_g2)
+            xt_metar_full = xt_metar_full - 0.5 * dt * (v_m1 + v_m2)
 
+    xt_grid_full = xt_grid_full.to(grid_ctx_full.dtype)
+    xt_metar_full = xt_metar_full.to(metar_ctx_full.dtype)
     if use_residual:
         g_rmask = _build_grid_residual_mask(device).squeeze(0)
         m_rmask = _build_metar_residual_mask(device).squeeze(0)
